@@ -57,13 +57,40 @@ if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and _secrets.get("gcp_service
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
 # --- fin bootstrap ---
 
-# ========= 0.1) ffmpeg portable =========
-try:
-    import imageio_ffmpeg
-    ff = imageio_ffmpeg.get_ffmpeg_exe()
-    os.environ["PATH"] = os.path.dirname(ff) + os.pathsep + os.environ.get("PATH", "")
-except Exception:
-    pass
+# ========= 0.1) ffmpeg portable (forzar binario y registrar en pydub) =========
+FFMPEG_BIN = None
+FFPROBE_BIN = None
+
+def _setup_ffmpeg():
+    global FFMPEG_BIN, FFPROBE_BIN
+    try:
+        import imageio_ffmpeg, os
+        FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()  # ruta absoluta al ffmpeg embebido
+        os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
+        os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
+    except Exception:
+        pass
+
+    # Registrar en pydub
+    try:
+        from pydub.utils import which
+        from pydub import AudioSegment as _AS
+        if not FFMPEG_BIN:
+            FFMPEG_BIN = which("ffmpeg")
+        if FFMPEG_BIN:
+            _AS.converter = FFMPEG_BIN
+        # ffprobe (opcional): intenta en PATH o junto a ffmpeg
+        FFPROBE_BIN = which("ffprobe")
+        if not FFPROBE_BIN and FFMPEG_BIN:
+            guess = os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe")
+            if os.path.exists(guess):
+                FFPROBE_BIN = guess
+        if FFPROBE_BIN:
+            _AS.ffprobe = FFPROBE_BIN
+    except Exception:
+        pass
+
+_setup_ffmpeg()
 
 # ========= 1) Resto de imports que dependen del entorno =========
 import yt_dlp
@@ -81,17 +108,24 @@ except Exception:
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-def _ffmpeg_ok(): return shutil.which("ffmpeg") is not None
+def _ffmpeg_ok():
+    return bool(FFMPEG_BIN) or shutil.which("ffmpeg") is not None
+
 def _to_float(s: str) -> float:
     s=(s or "").strip().replace(",", ".")
     try: return float(s)
     except: return 0.0
+
 def _ffprobe_text(args):
+    # Si no hay ffprobe, devolvemos vacío para que _probe_duration use el fallback con pydub
+    if not FFPROBE_BIN:
+        return ""
     try:
         out = subprocess.check_output(args, stderr=subprocess.STDOUT)
         return out.decode(errors="ignore")
     except Exception:
         return ""
+
 def _probe_duration(path: str) -> float:
     if not os.path.exists(path) or os.path.getsize(path)==0: return 0.0
     out=_ffprobe_text(['ffprobe','-v','error','-show_entries','format=duration',
@@ -111,7 +145,7 @@ def _probe_duration(path: str) -> float:
 def ensure_video_ok(video_path:str)->str:
     if _probe_duration(video_path)>0.1: return video_path
     remux=os.path.splitext(video_path)[0]+"_genpts.mp4"
-    subprocess.run(['ffmpeg','-y','-fflags','+genpts','-i',video_path,'-c','copy',
+    subprocess.run([FFMPEG_BIN,'-y','-fflags','+genpts','-i',video_path,'-c','copy',
                     '-movflags','+faststart', remux],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return remux if _probe_duration(remux)>0.1 else video_path
@@ -174,7 +208,7 @@ def resolve_source(user_in:str)->str:
         p=pathlib.Path(s)
         if p.suffix.lower()==".mp4": return ensure_video_ok(str(p.resolve()))
         out=p.with_suffix(".mp4")
-        subprocess.run(["ffmpeg","-y","-i",str(p),"-c:v","copy","-c:a","aac","-b:a","192k",
+        subprocess.run([FFMPEG_BIN,"-y","-i",str(p),"-c:v","copy","-c:a","aac","-b:a","192k",
                         "-movflags","+faststart",str(out)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return ensure_video_ok(str(out.resolve()))
@@ -182,7 +216,7 @@ def resolve_source(user_in:str)->str:
 
 # ---------- audio ----------
 def extract_audio(video:str, out="audio.wav")->str:
-    subprocess.run(["ffmpeg","-y","-i",video,"-ac","1","-ar","16000","-vn",
+    subprocess.run([FFMPEG_BIN,"-y","-i",video,"-ac","1","-ar","16000","-vn",
                     "-acodec","pcm_s16le",out],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return out
@@ -493,7 +527,7 @@ def fit_audio_to_video(video:str, audio_in:str, audio_out:str)->str:
         shutil.copyfile(audio_in, audio_out); return audio_out
     if a>v:
         factor=a/v
-        subprocess.run(['ffmpeg','-y','-i',audio_in,'-filter:a',_atempo_chain(factor),audio_out],
+        subprocess.run([FFMPEG_BIN,'-y','-i',audio_in,'-filter:a',_atempo_chain(factor),audio_out],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     else:
         pad=(v-a)+0.05
@@ -507,7 +541,7 @@ def fit_audio_to_video(video:str, audio_in:str, audio_out:str)->str:
     return audio_out
 
 def mux_video_audio(video:str, audio:str, out="video_doblado.mp4")->str:
-    subprocess.run(['ffmpeg','-y','-i',video,'-i',audio,'-map','0:v:0','-map','1:a:0',
+    subprocess.run([FFMPEG_BIN,'-y','-i',video,'-i',audio,'-map','0:v:0','-map','1:a:0',
                     '-c:v','copy','-c:a','aac','-b:a','192k','-movflags','+faststart', out],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return out
