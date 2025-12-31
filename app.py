@@ -1,4 +1,4 @@
-# app.py
+#  app.py
 # EN -> ES (España) con detección automática de credenciales:
 # - Lee AZURE_SPEECH_KEY / AZURE_SPEECH_REGION y gcp_service_account desde st.secrets (o .env)
 # - Google Cloud Translate si hay credenciales; si no, deep_translator fallback
