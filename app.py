@@ -175,15 +175,12 @@ def _looks_local(s:str)->bool:
     s=s.strip().strip('"').strip("'")
     return pathlib.Path(s).exists()
 
+# --- Descarga robusta: inspecciona formatos y elige el que exista ---
 def download_video(url: str) -> str:
-    """
-    Descarga el mejor formato disponible. Preferimos H.264 + AAC,
-    y si no existe, cogemos cualquier 'best' y lo convertimos a MP4.
-    """
     if not _ffmpeg_ok():
         raise RuntimeError("ffmpeg no encontrado.")
 
-    # Base de opciones común
+    # Opciones base para yt-dlp
     ydl_base = {
         "outtmpl": "%(id)s.%(ext)s",
         "quiet": True,
@@ -193,53 +190,80 @@ def download_video(url: str) -> str:
         "nocheckcertificate": True,
         "geo_bypass": True,
         "http_headers": {"User-Agent": UA},
-        # usa nuestro ffmpeg portable si lo tenemos
+        "allow_multiple_video_streams": False,
+        "allow_multiple_audio_streams": False,
+        # usar el ffmpeg portable
         **({"ffmpeg_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
-        # convierte a mp4 pase lo que pase (WEBM/HLS -> MP4)
+        # convertir SIEMPRE a mp4 (aunque baje webm/hls)
         "postprocessors": [
             {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
         ],
         "postprocessor_args": {
             "FFmpegVideoConvertor": ["-movflags", "faststart"]
         },
-        # evita combinaciones raras con múltiples pistas
-        "allow_multiple_video_streams": False,
-        "allow_multiple_audio_streams": False,
     }
 
-    # Estrategias de formato (de más específica a más genérica)
-    fmts = [
-        # 1) Preferimos H.264 (avc1/h264) + AAC/MP4A si existe
-        "bv*[vcodec~='^(avc1|h264)']+ba[acodec~='^(mp4a|aac)']/b[ext=mp4]/best",
-        # 2) Cualquier mejor combinado
-        "bv*+ba/b",
-        # 3) Best “clásico”
-        "bestvideo*+bestaudio*/best",
-        # 4) Último recurso
-        "best",
-    ]
+    # 1) Inspecciona formatos sin descargar
+    with yt_dlp.YoutubeDL({**ydl_base, "format": "best"}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        raise RuntimeError("No se pudo obtener la info del vídeo.")
 
-    last_err = None
-    for f in fmts:
+    fmts = info.get("formats") or []
+
+    # Helpers de selección
+    def is_progressive(f):
+        return f.get("vcodec") != "none" and f.get("acodec") != "none"
+    def is_video_only(f):
+        return f.get("vcodec") != "none" and f.get("acodec") == "none"
+    def is_audio_only(f):
+        return f.get("acodec") != "none" and f.get("vcodec") == "none"
+
+    # 2) Preferimos progresivo MP4 (vídeo+audio)
+    prog_mp4 = [f for f in fmts if is_progressive(f) and f.get("ext") == "mp4"]
+    if prog_mp4:
+        best = max(prog_mp4, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+        fmt = best["format_id"]
         try:
-            opts = dict(ydl_base)
-            opts["format"] = f
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                # nombre que yt-dlp cree que ha dejado
-                fn = ydl.prepare_filename(info)
-                # si el postprocessor convirtió a mp4, asegúrate de usar extensión mp4
+            with yt_dlp.YoutubeDL({**ydl_base, "format": fmt}) as ydl:
+                info2 = ydl.extract_info(url, download=True)
+                fn = ydl.prepare_filename(info2)
                 base, _ = os.path.splitext(fn)
-                mp4_candidate = base + ".mp4"
-                if os.path.exists(mp4_candidate):
-                    return ensure_video_ok(mp4_candidate)
-                # si no hay .mp4, usa el original y remuxa nosotros
-                return ensure_video_ok(fn)
+                mp4 = base + ".mp4"
+                return ensure_video_ok(mp4 if os.path.exists(mp4) else fn)
+        except Exception as e:
+            last_err = e
+    else:
+        last_err = None
+
+    # 3) Si no hay progresivo, combinamos bestvideo + bestaudio
+    vids = [f for f in fmts if is_video_only(f)]
+    auds = [f for f in fmts if is_audio_only(f)]
+    if vids and auds:
+        vids_sorted = sorted(vids, key=lambda f: (f.get("ext") == "mp4", f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+        auds_sorted = sorted(auds, key=lambda f: (f.get("ext") in ("m4a", "mp4"), f.get("abr") or 0, f.get("tbr") or 0), reverse=True)
+        v = vids_sorted[0]; a = auds_sorted[0]
+        fmt = f"{v['format_id']}+{a['format_id']}"
+        try:
+            with yt_dlp.YoutubeDL({**ydl_base, "format": fmt}) as ydl:
+                info2 = ydl.extract_info(url, download=True)
+                fn = ydl.prepare_filename(info2)
+                base, _ = os.path.splitext(fn)
+                mp4 = base + ".mp4"
+                return ensure_video_ok(mp4 if os.path.exists(mp4) else fn)
         except Exception as e:
             last_err = e
 
-    raise RuntimeError(f"Fallo descarga (yt-dlp): {last_err}")
-
+    # 4) Último recurso: 'best' y convertimos a mp4
+    try:
+        with yt_dlp.YoutubeDL({**ydl_base, "format": "best"}) as ydl:
+            info2 = ydl.extract_info(url, download=True)
+            fn = ydl.prepare_filename(info2)
+            base, _ = os.path.splitext(fn)
+            mp4 = base + ".mp4"
+            return ensure_video_ok(mp4 if os.path.exists(mp4) else fn)
+    except Exception as e:
+        raise RuntimeError(f"Fallo descarga (yt-dlp): {e if last_err is None else last_err}")
 
 def resolve_source(user_in:str)->str:
     s=user_in.strip().strip('"').strip("'")
