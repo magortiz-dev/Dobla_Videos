@@ -13,7 +13,7 @@ scipy==1.11.4
 
 # Audio utils
 pydub==0.25.1
-imageio-ffmpeg==0.4.9
+imageio-ffmpeg==0.5.1
 
 # Traducción Google (Cloud si hay credenciales; si no, público)
 deep-translator==1.11.4
@@ -29,4 +29,5 @@ wordninja>=2.0.0
 
 # Para el traductor de Google
 googletrans==4.0.0rc1
+
 
