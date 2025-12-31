@@ -15,6 +15,33 @@ from deep_translator import GoogleTranslator
 
 import tempfile, json
 
+# Carga .env si existe (opcional)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# Lee secrets sin romper si no existen (local)
+try:
+    _secrets = st.secrets
+except Exception:
+    _secrets = {}
+
+# Azure Speech → ENV
+if not os.getenv("AZURE_SPEECH_KEY") and _secrets.get("AZURE_SPEECH_KEY"):
+    os.environ["AZURE_SPEECH_KEY"] = str(_secrets["AZURE_SPEECH_KEY"])
+if not os.getenv("AZURE_SPEECH_REGION") and _secrets.get("AZURE_SPEECH_REGION"):
+    os.environ["AZURE_SPEECH_REGION"] = str(_secrets["AZURE_SPEECH_REGION"])
+
+# Google Cloud Translate → crea JSON temporal y apunta la ruta
+if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and _secrets.get("gcp_service_account"):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+    tmp.write(json.dumps(dict(_secrets["gcp_service_account"])).encode("utf-8"))
+    tmp.close()
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
+# --- fin bootstrap ---
+
 # Mapear Secrets 
 if "REMOVED_AZURE_KEY" in st.secrets:
     os.environ["REMOVED_AZURE_KEY"] = st.secrets["REMOVED_AZURE_KEY"]
@@ -434,6 +461,9 @@ def mux_video_audio(video:str, audio:str, out="video_doblado.mp4")->str:
 
 # ---------- UI ----------
 st.title("🎬 Dobador de videos EN→ES")
+
+has_azure = bool(os.getenv("AZURE_SPEECH_KEY"))
+azure_region = os.getenv("AZURE_SPEECH_REGION") or "—"
 
 engine = "Google Cloud" if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") else "deep_translator (fallback)"
 st.caption(f"Motor de traducción activo: {engine}  |  Azure KEY: {'✔️' if os.getenv('REMOVED_AZURE_KEY') else '❌'}  |  Región: {os.getenv('REMOVED_AZURE_REGION') or '—'}")
