@@ -27,38 +27,39 @@ import yt_dlp
 FFMPEG_BIN = None
 FFPROBE_BIN = None
 
-def _setup_ffmpeg():
-    global FFMPEG_BIN, FFPROBE_BIN
-    import shutil as _sh
-    sys_ffmpeg  = _sh.which("ffmpeg")
-    sys_ffprobe = _sh.which("ffprobe")
+FFMPEG_BIN = None
+
+def force_ffmpeg():
+    global FFMPEG_BIN
+    # 1) Intenta sistema
+    sys_ffmpeg = shutil.which("ffmpeg")
     if sys_ffmpeg:
         FFMPEG_BIN = sys_ffmpeg
-        FFPROBE_BIN = sys_ffprobe
     else:
+        # 2) Fallback a imageio-ffmpeg
         try:
             import imageio_ffmpeg
             FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
-            guess_probe = os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe")
-            FFPROBE_BIN = guess_probe if os.path.exists(guess_probe) else _sh.which("ffprobe")
-            os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH","")
+            # asegúralo en PATH por si libs lo buscan por nombre
+            os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
             os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
-        except Exception:
-            pass
-    # Registrar rutas en pydub
-    try:
-        if FFMPEG_BIN:
-            AudioSegment.converter = FFMPEG_BIN
-        if FFPROBE_BIN:
-            AudioSegment.ffprobe = FFPROBE_BIN
-    except Exception:
-        pass
+        except Exception as e:
+            raise RuntimeError(
+                "ffmpeg no encontrado y no se pudo cargar imageio-ffmpeg. "
+                "Asegúrate de tener 'imageio-ffmpeg' en requirements.txt."
+            ) from e
 
-_setup_ffmpeg()
+    # Registrar rutas en PyDub
+    AudioSegment.converter = FFMPEG_BIN
+    # ffprobe puede no existir: PyDub no lo requiere para exportar/leer si converter está bien
+    # Si lo tienes instalado, puedes añadir:
+    # AudioSegment.ffprobe = shutil.which("ffprobe")
+
+force_ffmpeg()
 
 def _ffmpeg_ok():
     import shutil as _sh
-    return bool(FFMPEG_BIN) or _sh.which("ffmpeg") is not None
+    return bool(_BIN) or _sh.which("") is not None
 
 def _to_float(s: str) -> float:
     s = (s or "").strip().replace(",", ".")
@@ -77,22 +78,9 @@ def _ffprobe_text(args):
         return ""
 
 def _probe_duration(path: str) -> float:
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        return 0.0
-    out = _ffprobe_text([FFPROBE_BIN or "ffprobe", "-v", "error",
-                         "-show_entries", "format=duration",
-                         "-of", "default:nokey=1:noprint_wrappers=1", path])
-    v = _to_float(out)
-    if v > 0:
-        return v
-    out = _ffprobe_text([FFPROBE_BIN or "ffprobe", "-v", "error",
-                         "-select_streams", "v:0",
-                         "-show_entries", "stream=duration",
-                         "-of", "default:nokey=1:noprint_wrappers=1", path])
-    v = _to_float(out)
-    if v > 0:
-        return v
     try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return 0.0
         seg = AudioSegment.from_file(path)
         return len(seg) / 1000.0
     except Exception:
@@ -107,7 +95,7 @@ def ensure_video_ok(video_path: str) -> str:
         pass
     remux = os.path.splitext(video_path)[0] + "_genpts.mp4"
     subprocess.run(
-        [FFMPEG_BIN or "ffmpeg", "-y", "-i", video_path,
+        [_BIN or "", "-y", "-i", video_path,
          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
          "-movflags", "+faststart", remux],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
@@ -226,8 +214,8 @@ def download_video_stable(url: str) -> str:
 
 def download_youtube(url: str) -> str:
     """Plan C para YouTube. Usa cookies/proxy si están en Secrets/ENV."""
-    if not _ffmpeg_ok():
-        raise RuntimeError("ffmpeg no encontrado.")
+    if not __ok():
+        raise RuntimeError(" no encontrado.")
     ydl_base = {
         "outtmpl": "%(id)s.%(ext)s",
         "quiet": True,
@@ -238,9 +226,9 @@ def download_youtube(url: str) -> str:
         "geo_bypass": True,
         "http_headers": {"User-Agent": UA},
         "extractor_args": {"youtube": {"player_client": ["web","android","ios","tv"]}},
-        **({"ffmpeg_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
-        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
-        "postprocessor_args": {"FFmpegVideoConvertor": ["-movflags", "faststart"]},
+        **({"_location": os.path.dirname(_BIN)} if _BIN else {}),
+        "postprocessors": [{"key": "VideoConvertor", "preferedformat": "mp4"}],
+        "postprocessor_args": {"VideoConvertor": ["-movflags", "faststart"]},
         "allow_multiple_video_streams": False,
         "allow_multiple_audio_streams": False,
         "format_sort": [
@@ -282,7 +270,7 @@ def resolve_source(user_in: str, uploaded_path: str | None) -> str:
         if p.suffix.lower() in {".mp4",".webm",".mkv",".mov"}:
             return ensure_video_ok(str(p.resolve()))
         out = p.with_suffix(".mp4")
-        subprocess.run([FFMPEG_BIN or "ffmpeg","-y","-i",str(p),
+        subprocess.run([_BIN or "","-y","-i",str(p),
                         "-c:v","copy","-c:a","aac","-b:a","192k",
                         "-movflags","+faststart",str(out)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -302,7 +290,7 @@ def resolve_source(user_in: str, uploaded_path: str | None) -> str:
         if p.suffix.lower() in {".mp4",".webm",".mkv",".mov"}:
             return ensure_video_ok(str(p.resolve()))
         out = p.with_suffix(".mp4")
-        subprocess.run([FFMPEG_BIN or "ffmpeg","-y","-i",str(p),
+        subprocess.run([_BIN or "","-y","-i",str(p),
                         "-c:v","copy","-c:a","aac","-b:a","192k",
                         "-movflags","+faststart",str(out)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -472,7 +460,7 @@ def mux_video_audio(video: str, audio: str, out="video_doblado.mp4") -> str:
 
 # ---------- UI ----------
 st.set_page_config(page_title="Doblador EN→ES estable", page_icon="🎬", layout="centered")
-st.title("🎬 Doblador EN→ES — Entrada estable (archivo / Drive / Dropbox / OneDrive / URL)")
+st.title("🎬 Doblador EN→ES ")
 
 st.markdown("**Entrada de vídeo** (recomendado: subir archivo o usar enlace directo).")
 col_u, col_o = st.columns([2,1])
@@ -482,7 +470,7 @@ uploaded = st.file_uploader("…o sube un vídeo (mp4/webm/mkv/mov)", type=["mp4
 
 st.caption(f"ffmpeg: {'✅' if _ffmpeg_ok() else '❌'}  |  Cookies YouTube: {'✅' if YTDLP_COOKIEFILE else '—'}")
 
-accion = st.radio("Acción", ["Obtener el texto en inglés","Obtener la traducción a español","Hacer el doblaje del video"], index=1)
+accion = st.radio("Acción", ["Obtener el texto en inglés","Obtener la traducción a español","Hacer el doblaje del video"], index=2)
 
 colA,colB = st.columns(2)
 with colA:
