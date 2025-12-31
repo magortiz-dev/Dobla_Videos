@@ -1,33 +1,24 @@
-# Requisitos probados en Windows 11 con Python 3.10–3.11
-# Nota: necesitas FFmpeg instalado en el sistema (no es un paquete pip).
+# --- UI ---
+streamlit>=1.32,<1.53
 
-streamlit==1.39.0
-yt-dlp>=2025.01.12
-pytube==15.0.0
+# --- Descargas (estable) ---
+yt-dlp==2024.12.13
+gdown==5.2.0
+requests>=2.31,<3
+imageio-ffmpeg>=0.4.9   # ffmpeg/ffprobe portables (fallback)
 
-# ASR (Whisper) + dependencias científicas
-openai-whisper>=20231117
-torch==2.3.1
-numpy==1.26.4
+# --- Audio/Video base ---
+pydub==0.25.1            # en Py 3.11 usa stdlib 'audioop' (OK)
+
+# --- ASR (Whisper CPU) ---
+openai-whisper==20231117  # versión estable
+torch==2.3.1              # wheel CPU compatible en Linux
+numpy==1.26.4             # Whisper + SciPy en Py3.11
 scipy==1.11.4
 
-# Audio utils
-pydub==0.25.1
-imageio-ffmpeg==0.5.1
+# --- Traducción ---
+google-cloud-translate>=2,<4  # usa translate_v2
+deep-translator>=1.11,<2      # fallback local
 
-# Traducción Google (Cloud si hay credenciales; si no, público)
-deep-translator==1.11.4
-google-cloud-translate==3.15.5
-google-auth==2.35.0
-protobuf==4.25.3
-
-# TTS Azure (opcional; si no hay credenciales, se usa Piper)
-azure-cognitiveservices-speech==1.38.0
-
-# Mejora del “despegado” de palabras en inglés (opcional)
-wordninja>=2.0.0
-
-# Para el traductor de Google
-googletrans==4.0.0rc1
-
-
+# --- TTS (Azure) ---
+azure-cognitiveservices-speech==1.41.1
