@@ -57,40 +57,58 @@ if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and _secrets.get("gcp_service
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
 # --- fin bootstrap ---
 
-# ========= 0.1) ffmpeg portable (forzar binario y registrar en pydub) =========
+# ========= 0.1) ffmpeg portable (preferir sistema; si no, imageio) =========
 FFMPEG_BIN = None
 FFPROBE_BIN = None
 
 def _setup_ffmpeg():
+    import shutil, os
     global FFMPEG_BIN, FFPROBE_BIN
-    try:
-        import imageio_ffmpeg, os
-        FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()  # ruta absoluta al ffmpeg embebido
-        os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
-        os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
-    except Exception:
-        pass
 
-    # Registrar en pydub
+    # 1) Preferir ffmpeg del sistema (en Streamlit Cloud suele estar disponible)
+    sys_ffmpeg  = shutil.which("ffmpeg")
+    sys_ffprobe = shutil.which("ffprobe")
+    if sys_ffmpeg:
+        FFMPEG_BIN  = sys_ffmpeg
+        FFPROBE_BIN = sys_ffprobe
+    else:
+        # 2) Fallback a imageio-ffmpeg (binario embebido)
+        try:
+            import imageio_ffmpeg
+            FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+            guess_probe = os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe")
+            FFPROBE_BIN = guess_probe if os.path.exists(guess_probe) else shutil.which("ffprobe")
+            os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH","")
+            os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
+        except Exception:
+            pass
+
+    # 3) Registrar en pydub
     try:
-        from pydub.utils import which
         from pydub import AudioSegment as _AS
-        if not FFMPEG_BIN:
-            FFMPEG_BIN = which("ffmpeg")
         if FFMPEG_BIN:
             _AS.converter = FFMPEG_BIN
-        # ffprobe (opcional): intenta en PATH o junto a ffmpeg
-        FFPROBE_BIN = which("ffprobe")
-        if not FFPROBE_BIN and FFMPEG_BIN:
-            guess = os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe")
-            if os.path.exists(guess):
-                FFPROBE_BIN = guess
         if FFPROBE_BIN:
             _AS.ffprobe = FFPROBE_BIN
     except Exception:
         pass
 
 _setup_ffmpeg()
+
+def _ffmpeg_ok():
+    import shutil
+    return bool(FFMPEG_BIN) or shutil.which("ffmpeg") is not None
+
+def _ffprobe_text(args):
+    # Si no hay ffprobe, devuelve vacío para caer al fallback de pydub
+    if not FFPROBE_BIN:
+        return ""
+    import subprocess
+    try:
+        out = subprocess.check_output(args, stderr=subprocess.STDOUT)
+        return out.decode(errors="ignore")
+    except Exception:
+        return ""
 
 # ========= 1) Resto de imports que dependen del entorno =========
 import yt_dlp
@@ -176,18 +194,19 @@ def _looks_local(s:str)->bool:
     s=s.strip().strip('"').strip("'")
     return pathlib.Path(s).exists()
 
-# --- Descarga robusta: inspecciona formatos y elige el que exista ---
+# --- Descarga robusta basada en *format strings* (sin capturas directas) ---
 def download_video(url: str) -> str:
     """
-    Descarga el vídeo con la mejor estrategia disponible:
-    1) MP4 progresivo (v+a)
-    2) bestvideo + bestaudio
-    3) Captura directa vía ffmpeg (m3u8/https)
-    Convierte/normaliza a MP4 y devuelve la ruta final.
+    Estrategia:
+      1) Intentar progresivo MP4 (v+a) sesgado a h264/aac.
+      2) Intentar bestvideo+bestaudio con merge.
+      3) 'best' genérico.
+    Siempre convertimos a MP4 con faststart.
     """
     if not _ffmpeg_ok():
         raise RuntimeError("ffmpeg no encontrado.")
 
+    # Opciones base para yt-dlp
     ydl_base = {
         "outtmpl": "%(id)s.%(ext)s",
         "quiet": True,
@@ -197,117 +216,50 @@ def download_video(url: str) -> str:
         "nocheckcertificate": True,
         "geo_bypass": True,
         "http_headers": {"User-Agent": UA},
-        # Forzamos cliente Android para maximizar MP4 progresivo disponible
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
-        # usa ffmpeg portable si lo tenemos
+        # fuerza cliente android + web para maximizar disponibilidad de MP4
+        "extractor_args": {"youtube": {"player_client": ["web", "android"]}},
+        # usar nuestro ffmpeg
         **({"ffmpeg_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
-        # convertir SIEMPRE a mp4 (webm/hls -> mp4)
+        # convertir / remux a mp4 siempre
         "postprocessors": [
             {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
         ],
         "postprocessor_args": {"FFmpegVideoConvertor": ["-movflags", "faststart"]},
         "allow_multiple_video_streams": False,
         "allow_multiple_audio_streams": False,
-        "extract_flat": False,
-        "ignoreerrors": "only_download",  # no romper por formatos que falten
+        # ordenar formatos favoreciendo https + mp4 + h264/aac + resolución/tasa
+        "format_sort": [
+            "proto:https", "ext:mp4:m4a", "vcodec:h264:avc1", "acodec:aac:mp4a",
+            "res", "tbr"
+        ],
+        "compat_opts": ["format-sort-force"]
     }
 
-    # 1) Listar formatos reales
-    with yt_dlp.YoutubeDL({**ydl_base, "format": "best"}) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if not info:
-        raise RuntimeError("No se pudo obtener metadatos del vídeo.")
-    fmts = info.get("formats") or []
+    attempts = [
+        # Progresivo MP4 preferente si existe
+        "bv*+ba/b[ext=mp4]/b[ext=mp4]",
+        # Cualquier bestvideo+bestaudio y si no, best
+        "bestvideo*+bestaudio*/best",
+        "best",
+    ]
 
-    def is_progressive(f): return f.get("vcodec") != "none" and f.get("acodec") != "none"
-    def is_video_only(f): return f.get("vcodec") != "none" and f.get("acodec") == "none"
-    def is_audio_only(f): return f.get("acodec") != "none" and f.get("vcodec") == "none"
-
-    # 2) Preferimos progresivo MP4
-    prog_mp4 = [f for f in fmts if is_progressive(f) and (f.get("ext") == "mp4")]
-    if prog_mp4:
-        best = max(prog_mp4, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
-        fmt = best.get("format_id")
+    last_err = None
+    for fmt in attempts:
         try:
-            with yt_dlp.YoutubeDL({**ydl_base, "format": fmt}) as ydl:
-                info2 = ydl.extract_info(url, download=True)
-                fn = ydl.prepare_filename(info2)
+            opts = dict(ydl_base)
+            opts["format"] = fmt
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                fn = ydl.prepare_filename(info)
                 base, _ = os.path.splitext(fn)
                 mp4 = base + ".mp4"
-                return ensure_video_ok(mp4 if os.path.exists(mp4) else fn)
-        except Exception as e:
-            last_err = e
-    else:
-        last_err = None
-
-    # 3) Mezcla bestvideo + bestaudio (prioriza mp4/m4a)
-    vids = [f for f in fmts if is_video_only(f)]
-    auds = [f for f in fmts if is_audio_only(f)]
-    if vids and auds:
-        vids_sorted = sorted(vids, key=lambda f: (f.get("ext") == "mp4", f.get("height") or 0, f.get("tbr") or 0), reverse=True)
-        auds_sorted = sorted(auds, key=lambda f: (f.get("ext") in ("m4a", "mp4", "aac"), f.get("abr") or 0, f.get("tbr") or 0), reverse=True)
-        v = vids_sorted[0]; a = auds_sorted[0]
-        fmt = f"{v['format_id']}+{a['format_id']}"
-        try:
-            with yt_dlp.YoutubeDL({**ydl_base, "format": fmt}) as ydl:
-                info2 = ydl.extract_info(url, download=True)
-                fn = ydl.prepare_filename(info2)
-                base, _ = os.path.splitext(fn)
-                mp4 = base + ".mp4"
-                return ensure_video_ok(mp4 if os.path.exists(mp4) else fn)
+                # Si el postprocesador ya lo dejó en mp4, úsalo
+                final = mp4 if os.path.exists(mp4) else fn
+                return ensure_video_ok(final)
         except Exception as e:
             last_err = e
 
-    # 4) Captura directa por ffmpeg desde una URL disponible
-    #    (p. ej., HLS .m3u8 o http(s) progresivo)
-    #    Elegimos la mejor por altura/bitrate.
-    cand = []
-    for f in fmts:
-        proto = f.get("protocol") or ""
-        url_f = f.get("url")
-        if not url_f:
-            continue
-        # Prioriza m3u8_native/m3u8 y https progresivo
-        prio = 0
-        if "m3u8" in proto:
-            prio = 3
-        elif proto in ("https", "http"):
-            prio = 2
-        # descarta DASH fragmentado sin URL directa
-        height = f.get("height") or 0
-        tbr = f.get("tbr") or 0
-        cand.append((prio, height, tbr, url_f))
-    cand.sort(reverse=True)
-    if cand:
-        _, _, _, direct_url = cand[0]
-        # captura con ffmpeg -> mp4
-        out_mp4 = f"{info.get('id','video')}_capture.mp4"
-        # para HLS hace falta whitelist de protocolos
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-i", direct_url,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            out_mp4
-        ]
-        try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return ensure_video_ok(out_mp4)
-        except Exception as e:
-            last_err = e
-
-    # 5) Último recurso: 'best' puro (que ya convertimos a mp4)
-    try:
-        with yt_dlp.YoutubeDL({**ydl_base, "format": "best"}) as ydl:
-            info2 = ydl.extract_info(url, download=True)
-            fn = ydl.prepare_filename(info2)
-            base, _ = os.path.splitext(fn)
-            mp4 = base + ".mp4"
-            return ensure_video_ok(mp4 if os.path.exists(mp4) else fn)
-    except Exception as e:
-        raise RuntimeError(f"Fallo descarga (yt-dlp): {e if last_err is None else last_err}")
-
+    raise RuntimeError(f"Fallo descarga (yt-dlp): {last_err}")
 
 def resolve_source(user_in:str)->str:
     s=user_in.strip().strip('"').strip("'")
@@ -682,7 +634,7 @@ accion = st.radio("Acción", ["Obtener el texto en inglés","Obtener la traducci
 
 colA,colB = st.columns(2)
 with colA:
-    model = st.selectbox("Modelo Whisper", ["small","base"], index=0)
+    model = st.selectbox("Modelo Whisper", ["medium","small","base"], index=1)
 with colB:
     voice = st.selectbox("Voz TTS (Azure)", ["es-ES-DarioNeural","es-ES-AlvaroNeural","es-ES-TeoNeural",
                                              "es-ES-ArnauNeural","es-ES-ElviraNeural","es-ES-LiaNeural"], index=0)
