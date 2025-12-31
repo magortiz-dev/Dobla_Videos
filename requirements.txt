@@ -2,8 +2,8 @@
 # Nota: necesitas FFmpeg instalado en el sistema (no es un paquete pip).
 
 streamlit==1.39.0
-yt-dlp>=2020.01.12
-pytube>=15.0.0
+yt-dlp==2025.01.12
+pytube==15.0.0
 
 # ASR (Whisper) + dependencias científicas
 openai-whisper>=20231117
@@ -16,8 +16,10 @@ pydub==0.25.1
 imageio-ffmpeg==0.4.9
 
 # Traducción Google (Cloud si hay credenciales; si no, público)
-deep-translator>=1.11.4
+deep-translator==1.11.4
 google-cloud-translate==3.15.5
+google-auth==2.35.0
+protobuf==4.25.3
 
 # TTS Azure (opcional; si no hay credenciales, se usa Piper)
 azure-cognitiveservices-speech==1.38.0
