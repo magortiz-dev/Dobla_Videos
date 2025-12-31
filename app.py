@@ -142,13 +142,29 @@ def _probe_duration(path: str) -> float:
         return len(seg)/1000.0
     except Exception:
         return 0.0
-def ensure_video_ok(video_path:str)->str:
-    if _probe_duration(video_path)>0.1: return video_path
-    remux=os.path.splitext(video_path)[0]+"_genpts.mp4"
-    subprocess.run([FFMPEG_BIN,'-y','-fflags','+genpts','-i',video_path,'-c','copy',
-                    '-movflags','+faststart', remux],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return remux if _probe_duration(remux)>0.1 else video_path
+def ensure_video_ok(video_path: str) -> str:
+    """
+    Garantiza que el contenedor final sea MP4 con timestamps correctos.
+    Si ya es válido, lo devuelve tal cual.
+    """
+    try:
+        dur = _probe_duration(video_path)
+        if dur > 0.1 and video_path.lower().endswith(".mp4"):
+            return video_path
+    except Exception:
+        pass
+
+    remux = os.path.splitext(video_path)[0] + "_genpts.mp4"
+    # Copia vídeo sin recodificar + audio AAC (si no lo estaba) y faststart
+    subprocess.run(
+        [FFMPEG_BIN, "-y", "-i", video_path,
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+         "-movflags", "+faststart", remux],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+    )
+
+    # Si por cualquier motivo falla, devolvemos el original
+    return remux if _probe_duration(remux) > 0.1 else video_path
 
 # ---------- descarga / entrada ----------
 def _first_url(s:str):
@@ -159,44 +175,71 @@ def _looks_local(s:str)->bool:
     s=s.strip().strip('"').strip("'")
     return pathlib.Path(s).exists()
 
-def download_video(url:str)->str:
-    if not _ffmpeg_ok(): raise RuntimeError("ffmpeg no encontrado.")
-    formats=[
-        "best[ext=mp4][vcodec*=avc1][acodec*=mp4a]/best[ext=mp4]",
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
-        "bv*+ba/b","22/18"
-    ]
-    ydl_opts={
-        "outtmpl":"%(id)s.%(ext)s","merge_output_format":"mp4","noplaylist":True,"quiet":True,
-        "retries":25,"fragment_retries":25,"concurrent_fragment_downloads":5,
-        "nocheckcertificate":True,"geo_bypass":True,"http_headers":{"User-Agent":UA},
-        "postprocessor_args":{"FFmpegVideoRemuxer":["-movflags","faststart"]},
-        "postprocessors":[{"key":"FFmpegVideoRemuxer","preferedformat":"mp4"}],
+def download_video(url: str) -> str:
+    """
+    Descarga el mejor formato disponible. Preferimos H.264 + AAC,
+    y si no existe, cogemos cualquier 'best' y lo convertimos a MP4.
+    """
+    if not _ffmpeg_ok():
+        raise RuntimeError("ffmpeg no encontrado.")
+
+    # Base de opciones común
+    ydl_base = {
+        "outtmpl": "%(id)s.%(ext)s",
+        "quiet": True,
+        "noplaylist": True,
+        "retries": 10,
+        "fragment_retries": 10,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "http_headers": {"User-Agent": UA},
+        # usa nuestro ffmpeg portable si lo tenemos
+        **({"ffmpeg_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
+        # convierte a mp4 pase lo que pase (WEBM/HLS -> MP4)
+        "postprocessors": [
+            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+        ],
+        "postprocessor_args": {
+            "FFmpegVideoConvertor": ["-movflags", "faststart"]
+        },
+        # evita combinaciones raras con múltiples pistas
+        "allow_multiple_video_streams": False,
+        "allow_multiple_audio_streams": False,
     }
-    last=None
-    for f in formats:
+
+    # Estrategias de formato (de más específica a más genérica)
+    fmts = [
+        # 1) Preferimos H.264 (avc1/h264) + AAC/MP4A si existe
+        "bv*[vcodec~='^(avc1|h264)']+ba[acodec~='^(mp4a|aac)']/b[ext=mp4]/best",
+        # 2) Cualquier mejor combinado
+        "bv*+ba/b",
+        # 3) Best “clásico”
+        "bestvideo*+bestaudio*/best",
+        # 4) Último recurso
+        "best",
+    ]
+
+    last_err = None
+    for f in fmts:
         try:
-            opts=dict(ydl_opts); opts["format"]=f
+            opts = dict(ydl_base)
+            opts["format"] = f
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info=ydl.extract_info(url, download=True)
-                fn=ydl.prepare_filename(info)
-                if not fn.endswith(".mp4"): fn=os.path.splitext(fn)[0]+".mp4"
-                if not os.path.exists(fn):
-                    files=glob.glob("*.mp4")
-                    fn=max(files,key=os.path.getctime)
-                return fn
+                info = ydl.extract_info(url, download=True)
+                # nombre que yt-dlp cree que ha dejado
+                fn = ydl.prepare_filename(info)
+                # si el postprocessor convirtió a mp4, asegúrate de usar extensión mp4
+                base, _ = os.path.splitext(fn)
+                mp4_candidate = base + ".mp4"
+                if os.path.exists(mp4_candidate):
+                    return ensure_video_ok(mp4_candidate)
+                # si no hay .mp4, usa el original y remuxa nosotros
+                return ensure_video_ok(fn)
         except Exception as e:
-            last=e
-    # fallback pytube
-    try:
-        from pytube import YouTube
-        yt=YouTube(url)
-        stream=(yt.streams.filter(progressive=True,file_extension="mp4")
-                .order_by("resolution").desc().first()
-                or yt.streams.filter(progressive=True,file_extension="mp4",res="360p").first())
-        return stream.download(filename=f"{yt.video_id}.mp4")
-    except Exception as e2:
-        raise RuntimeError(f"Fallo descarga: {last} / {e2}")
+            last_err = e
+
+    raise RuntimeError(f"Fallo descarga (yt-dlp): {last_err}")
+
 
 def resolve_source(user_in:str)->str:
     s=user_in.strip().strip('"').strip("'")
