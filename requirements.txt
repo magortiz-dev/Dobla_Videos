@@ -2,7 +2,7 @@
 # Nota: necesitas FFmpeg instalado en el sistema (no es un paquete pip).
 
 streamlit==1.39.0
-yt-dlp==2025.01.12
+yt-dlp>=2025.01.12
 pytube==15.0.0
 
 # ASR (Whisper) + dependencias científicas
@@ -29,3 +29,4 @@ wordninja>=2.0.0
 
 # Para el traductor de Google
 googletrans==4.0.0rc1
+
