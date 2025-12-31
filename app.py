@@ -8,6 +8,7 @@
 import os, re, io, glob, shutil, subprocess, pathlib, json, tempfile
 import numpy as np
 import streamlit as st
+import requests
 from pydub import AudioSegment
 from scipy.io import wavfile
 from urllib.parse import urlparse
@@ -149,6 +150,68 @@ except Exception:
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
+def _is_youtube(url: str) -> bool:
+    return bool(re.search(r'(youtube\.com|youtu\.be)', url or '', re.I))
+
+def _is_gdrive(url: str) -> bool:
+    return 'drive.google.com' in (url or '') or 'docs.google.com/uc' in (url or '')
+
+def _is_dropbox(url: str) -> bool:
+    return 'dropbox.com' in (url or '')
+
+def _is_onedrive(url: str) -> bool:
+    return ('1drv.ms' in (url or '')) or ('onedrive.live.com' in (url or '')) or ('sharepoint.com' in (url or ''))
+
+def _download_http(url: str, out_path: str, chunk=1<<20) -> str:
+    """Descarga directa http/https básica con cabeceras limpias."""
+    with requests.get(url, stream=True, timeout=60, headers={"User-Agent": UA}) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for b in r.iter_content(chunk_size=chunk):
+                if b:
+                    f.write(b)
+    return out_path
+
+def _gdrive_file_id(url: str) -> str | None:
+    # Soporta varias formas de Drive
+    # https://drive.google.com/file/d/FILEID/view?usp=sharing
+    m = re.search(r'/d/([A-Za-z0-9_-]{10,})', url)
+    if m: return m.group(1)
+    # https://drive.google.com/uc?id=FILEID&export=download
+    m = re.search(r'[?&]id=([A-Za-z0-9_-]{10,})', url)
+    if m: return m.group(1)
+    return None
+
+def download_from_gdrive(url: str, out_path: str) -> str:
+    """Usa gdown para manejar confirm tokens de archivos grandes."""
+    try:
+        import gdown
+    except Exception:
+        raise RuntimeError("Falta gdown. Añade gdown==5.2.0 a requirements.txt")
+    fid = _gdrive_file_id(url)
+    if fid:
+        gdown.download(id=fid, output=out_path, quiet=True)
+    else:
+        gdown.download(url=url, output=out_path, quiet=True)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError("Descarga de Google Drive falló (archivo vacío).")
+    return out_path
+
+def _dropbox_direct(url: str) -> str:
+    # Enlaces de Dropbox compartidos => fuerza descarga directa
+    # https://www.dropbox.com/s/<id>/file.mp4?dl=0  -> dl=1
+    if 'dl=' in url:
+        return re.sub(r'dl=\d', 'dl=1', url)
+    sep = '&' if '?' in url else '?'
+    return f"{url}{sep}dl=1"
+
+def _onedrive_direct(url: str) -> str:
+    # La mayoría de enlaces de compartición aceptan '?download=1'
+    if re.search(r'[?&]download=1', url):
+        return url
+    sep = '&' if '?' in url else '?'
+    return f"{url}{sep}download=1"
+
 def _ffmpeg_ok():
     return bool(FFMPEG_BIN) or shutil.which("ffmpeg") is not None
 
@@ -220,11 +283,47 @@ def _looks_local(s:str)->bool:
 # --- Descarga robusta basada en *format strings* (sin capturas directas) ---
 def download_video(url: str) -> str:
     """
-    Descarga robusta con yt-dlp:
-      - Usa cookies/proxy si están en Secrets/ENV.
-      - Fuerza clientes (web/android/ios/tv) y cabeceras limpias.
-      - Convierte/remuxa siempre a MP4 (faststart).
+    Descarga estable sin depender de cookies:
+      - Google Drive (gdown)
+      - Dropbox (dl=1)
+      - OneDrive/SharePoint (?download=1)
+      - HTTP/HTTPS directo
+    Devuelve un .mp4 válido (remux si hace falta).
     """
+    tmp_dir = tempfile.gettempdir()
+    base = "video_in"
+    out = os.path.join(tmp_dir, base)  # extensión se resolverá
+    # 1) Google Drive
+    if _is_gdrive(url):
+        path = out + ".bin"
+        download_from_gdrive(url, path)
+        # si no es mp4, remux a mp4
+        final_mp4 = ensure_video_ok(path)
+        return final_mp4
+    # 2) Dropbox
+    if _is_dropbox(url):
+        durl = _dropbox_direct(url)
+        path = out + ".mp4"
+        _download_http(durl, path)
+        return ensure_video_ok(path)
+    # 3) OneDrive/SharePoint
+    if _is_onedrive(url):
+        durl = _onedrive_direct(url)
+        path = out + ".mp4"
+        _download_http(durl, path)
+        return ensure_video_ok(path)
+    # 4) Enlace directo http/https
+    if re.match(r'^https?://', url, re.I):
+        # intenta adivinar extensión
+        ext = '.mp4' if '.mp4' in url.lower() else ('.webm' if '.webm' in url.lower() else '.bin')
+        path = out + ext
+        _download_http(url, path)
+        return ensure_video_ok(path)
+
+    raise RuntimeError("URL no soportada para descarga directa. Sube el archivo o usa un enlace directo (Drive/Dropbox/OneDrive/MP4).")
+
+def download_youtube(url: str) -> str:
+    import yt_dlp, os
     if not _ffmpeg_ok():
         raise RuntimeError("ffmpeg no encontrado.")
 
@@ -232,63 +331,37 @@ def download_video(url: str) -> str:
         "outtmpl": "%(id)s.%(ext)s",
         "quiet": True,
         "noplaylist": True,
-        "retries": 12,
-        "fragment_retries": 12,
+        "retries": 8,
+        "fragment_retries": 8,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "geo_bypass_country": "ES",  # puedes cambiarlo si te interesa
-        "http_headers": {
-            "User-Agent": UA,
-            "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "*/*",
-            "Connection": "keep-alive",
-        },
-        # Maximiza formatos compatibles
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "android", "ios", "tv"],
-            }
-        },
-        # Usa ffmpeg “conocido”
+        "http_headers": {"User-Agent": UA},
+        "extractor_args": {"youtube": {"player_client": ["web","android","ios","tv"]}},
         **({"ffmpeg_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
-        # Convertir SIEMPRE a mp4
-        "postprocessors": [
-            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-        ],
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
         "postprocessor_args": {"FFmpegVideoConvertor": ["-movflags", "faststart"]},
         "allow_multiple_video_streams": False,
         "allow_multiple_audio_streams": False,
-        # Ordena prefiriendo https/h264/aac/mp4 y más calidad
         "format_sort": [
-            "proto:https", "ext:mp4:m4a", "vcodec:h264:avc1", "acodec:aac:mp4a",
-            "res", "tbr"
+            "proto:https", "ext:mp4:m4a", "vcodec:h264:avc1", "acodec:aac:mp4a", "res", "tbr"
         ],
         "compat_opts": ["format-sort-force"],
-        # Pedimos ir más “despacio” para evitar 403 por throttle
-        "sleep_interval_requests": 0.5,
-        "throttled_rate": 1024 * 1024,  # 1MB/s
     }
-
-    # Inyecta cookies/proxy si los tenemos
-    if YTDLP_COOKIES_TXT:
-        ydl_base["cookiefile"] = YTDLP_COOKIES_TXT
-    if YTDLP_PROXY:
+    # Si ya hiciste el bootstrap de cookies/proxy, puedes inyectarlos aquí:
+    if 'YTDLP_COOKIEFILE' in globals() and YTDLP_COOKIEFILE:
+        ydl_base["cookiefile"] = YTDLP_COOKIEFILE
+    if 'YTDLP_PROXY' in globals() and YTDLP_PROXY:
         ydl_base["proxy"] = YTDLP_PROXY
 
     attempts = [
-        # Progresivo MP4 si existe
         "bv*+ba/b[ext=mp4]/b[ext=mp4]",
-        # Cualquier combinación razonable
         "bestvideo*+bestaudio*/best",
-        # Último recurso
         "best",
     ]
-
     last_err = None
     for fmt in attempts:
         try:
-            opts = dict(ydl_base)
-            opts["format"] = fmt
+            opts = dict(ydl_base); opts["format"] = fmt
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 fn = ydl.prepare_filename(info)
@@ -298,24 +371,30 @@ def download_video(url: str) -> str:
                 return ensure_video_ok(final)
         except Exception as e:
             last_err = e
+    raise RuntimeError(f"Fallo descarga YouTube: {last_err}")
 
-    raise RuntimeError(f"Fallo descarga (yt-dlp): {last_err}")
-
-def resolve_source(user_in:str)->str:
-    s=user_in.strip().strip('"').strip("'")
-    if s.lower().startswith(('http://','https://')) or _first_url(s):
-        url=s if s.lower().startswith(('http://','https://')) else _first_url(s)
-        path=download_video(url)
-        return ensure_video_ok(path)
-    if _looks_local(s):
-        p=pathlib.Path(s)
-        if p.suffix.lower()==".mp4": return ensure_video_ok(str(p.resolve()))
-        out=p.with_suffix(".mp4")
+def resolve_source(user_in: str) -> str:
+    s = (user_in or "").strip().strip('"').strip("'")
+    # Ruta local
+    if pathlib.Path(s).exists():
+        p = pathlib.Path(s)
+        if p.suffix.lower() in {".mp4",".webm",".mkv",".mov"}:
+            return ensure_video_ok(str(p.resolve()))
+        # cualquier otro: convertir a mp4 rápido
+        out = p.with_suffix(".mp4")
         subprocess.run([FFMPEG_BIN,"-y","-i",str(p),"-c:v","copy","-c:a","aac","-b:a","192k",
                         "-movflags","+faststart",str(out)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return ensure_video_ok(str(out.resolve()))
-    raise RuntimeError("Proporciona URL de YouTube o ruta local válida.")
+        return ensure_video_ok(str(out))
+    # URL
+    if re.match(r'^https?://', s, re.I):
+        if _is_youtube(s):
+            # Aviso: menos estable en la nube. Mejor pedir archivo.
+            # Si quieres mantenerlo, llama a download_youtube(s)
+            return download_youtube(s)
+        else:
+            return download_video(s)
+    raise RuntimeError("Proporciona una ruta local válida o una URL directa (Drive/Dropbox/OneDrive/MP4).")
 
 # ---------- audio ----------
 def extract_audio(video:str, out="audio.wav")->str:
@@ -349,7 +428,7 @@ def _squash(label:str)->str: return re.sub(r"\s+","",label)
 def normalize_english_urls(text:str)->str:
     if not text: return text
     def _host_path(m):
-        host=_squash(m.group(1)); tld=m.group(2).lower(); path=m.group(3)
+        host=_sqsh(m.group(1)); tld=m.group(2).lower(); path=m.group(3)
         path=re.sub(r"\s*/\s*","/", path)
         return f"{host}.{tld}/{path}"
     def _host_only(m):
