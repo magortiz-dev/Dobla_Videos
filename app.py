@@ -55,6 +55,29 @@ if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and _secrets.get("gcp_service
     tmp.write(json.dumps(svc_plain).encode("utf-8"))
     tmp.close()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
+# --- yt-dlp auth (cookies/proxy) desde Secrets/ENV ---
+import tempfile
+
+YTDLP_COOKIES_TXT = None
+YTDLP_PROXY = None
+
+def _setup_ytdlp_auth_from_secrets():
+    global YTDLP_COOKIES_TXT, YTDLP_PROXY
+    try:
+        secrets = st.secrets
+    except Exception:
+        secrets = {}
+    # 1) Cookies en formato Netscape (pegar todo el .txt en Secrets)
+    cookies_blob = os.getenv("YTDLP_COOKIES") or secrets.get("YTDLP_COOKIES")
+    if cookies_blob and isinstance(cookies_blob, str):
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".cookies.txt")
+        tf.write(cookies_blob.encode("utf-8"))
+        tf.close()
+        YTDLP_COOKIES_TXT = tf.name
+    # 2) Proxy opcional (http://usuario:pass@host:puerto o socks5://...)
+    YTDLP_PROXY = os.getenv("YTDLP_PROXY") or secrets.get("YTDLP_PROXY")
+
+_setup_ytdlp_auth_from_secrets()
 # --- fin bootstrap ---
 
 # ========= 0.1) ffmpeg portable (preferir sistema; si no, imageio) =========
@@ -197,49 +220,67 @@ def _looks_local(s:str)->bool:
 # --- Descarga robusta basada en *format strings* (sin capturas directas) ---
 def download_video(url: str) -> str:
     """
-    Estrategia:
-      1) Intentar progresivo MP4 (v+a) sesgado a h264/aac.
-      2) Intentar bestvideo+bestaudio con merge.
-      3) 'best' genérico.
-    Siempre convertimos a MP4 con faststart.
+    Descarga robusta con yt-dlp:
+      - Usa cookies/proxy si están en Secrets/ENV.
+      - Fuerza clientes (web/android/ios/tv) y cabeceras limpias.
+      - Convierte/remuxa siempre a MP4 (faststart).
     """
     if not _ffmpeg_ok():
         raise RuntimeError("ffmpeg no encontrado.")
 
-    # Opciones base para yt-dlp
     ydl_base = {
         "outtmpl": "%(id)s.%(ext)s",
         "quiet": True,
         "noplaylist": True,
-        "retries": 10,
-        "fragment_retries": 10,
+        "retries": 12,
+        "fragment_retries": 12,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "http_headers": {"User-Agent": UA},
-        # fuerza cliente android + web para maximizar disponibilidad de MP4
-        "extractor_args": {"youtube": {"player_client": ["web", "android"]}},
-        # usar nuestro ffmpeg
+        "geo_bypass_country": "ES",  # puedes cambiarlo si te interesa
+        "http_headers": {
+            "User-Agent": UA,
+            "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        },
+        # Maximiza formatos compatibles
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android", "ios", "tv"],
+            }
+        },
+        # Usa ffmpeg “conocido”
         **({"ffmpeg_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
-        # convertir / remux a mp4 siempre
+        # Convertir SIEMPRE a mp4
         "postprocessors": [
             {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
         ],
         "postprocessor_args": {"FFmpegVideoConvertor": ["-movflags", "faststart"]},
         "allow_multiple_video_streams": False,
         "allow_multiple_audio_streams": False,
-        # ordenar formatos favoreciendo https + mp4 + h264/aac + resolución/tasa
+        # Ordena prefiriendo https/h264/aac/mp4 y más calidad
         "format_sort": [
             "proto:https", "ext:mp4:m4a", "vcodec:h264:avc1", "acodec:aac:mp4a",
             "res", "tbr"
         ],
-        "compat_opts": ["format-sort-force"]
+        "compat_opts": ["format-sort-force"],
+        # Pedimos ir más “despacio” para evitar 403 por throttle
+        "sleep_interval_requests": 0.5,
+        "throttled_rate": 1024 * 1024,  # 1MB/s
     }
 
+    # Inyecta cookies/proxy si los tenemos
+    if YTDLP_COOKIES_TXT:
+        ydl_base["cookiefile"] = YTDLP_COOKIES_TXT
+    if YTDLP_PROXY:
+        ydl_base["proxy"] = YTDLP_PROXY
+
     attempts = [
-        # Progresivo MP4 preferente si existe
+        # Progresivo MP4 si existe
         "bv*+ba/b[ext=mp4]/b[ext=mp4]",
-        # Cualquier bestvideo+bestaudio y si no, best
+        # Cualquier combinación razonable
         "bestvideo*+bestaudio*/best",
+        # Último recurso
         "best",
     ]
 
@@ -253,7 +294,6 @@ def download_video(url: str) -> str:
                 fn = ydl.prepare_filename(info)
                 base, _ = os.path.splitext(fn)
                 mp4 = base + ".mp4"
-                # Si el postprocesador ya lo dejó en mp4, úsalo
                 final = mp4 if os.path.exists(mp4) else fn
                 return ensure_video_ok(final)
         except Exception as e:
