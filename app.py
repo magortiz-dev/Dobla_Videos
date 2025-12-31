@@ -14,16 +14,29 @@ from urllib.parse import urlparse
 
 # ========= 0) Bootstrap de secrets / entorno =========
 # (Carga .env si existe y mapea st.secrets -> variables de entorno ANTES de usar nada)
+# --- Secrets & ENV bootstrap (colocar al principio de app.py) ---
+from collections.abc import Mapping
+
+# Carga .env si existe (opcional)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
+# Acceso tolerante a st.secrets (en local puede no existir)
 try:
-    _secrets = st.secrets   # en Streamlit Cloud existe; en local puede no
+    _secrets = st.secrets
 except Exception:
     _secrets = {}
+
+def _to_plain(obj):
+    """Convierte AttrDict/Mapping/list/tuple recursivamente a tipos JSON-serializables."""
+    if isinstance(obj, Mapping):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(x) for x in obj]
+    return obj
 
 # Azure Speech -> ENV
 if not os.getenv("AZURE_SPEECH_KEY") and _secrets.get("AZURE_SPEECH_KEY"):
@@ -31,12 +44,18 @@ if not os.getenv("AZURE_SPEECH_KEY") and _secrets.get("AZURE_SPEECH_KEY"):
 if not os.getenv("AZURE_SPEECH_REGION") and _secrets.get("AZURE_SPEECH_REGION"):
     os.environ["AZURE_SPEECH_REGION"] = str(_secrets["AZURE_SPEECH_REGION"])
 
-# Google Cloud Translate -> escribe JSON temporal y apunta GOOGLE_APPLICATION_CREDENTIALS
+# Google Cloud Translate -> crea JSON temporal desde TOML (sección gcp_service_account)
 if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and _secrets.get("gcp_service_account"):
+    svc_plain = _to_plain(_secrets["gcp_service_account"])
+    # Normaliza la private_key por si la pegaron con '\n' en lugar de saltos reales
+    pk = svc_plain.get("private_key")
+    if isinstance(pk, str) and "\\n" in pk and "BEGIN PRIVATE KEY" in pk:
+        svc_plain["private_key"] = pk.replace("\\n", "\n")
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    tmp.write(json.dumps(dict(_secrets["gcp_service_account"])).encode("utf-8"))
+    tmp.write(json.dumps(svc_plain).encode("utf-8"))
     tmp.close()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
+# --- fin bootstrap ---
 
 # ========= 0.1) ffmpeg portable =========
 try:
