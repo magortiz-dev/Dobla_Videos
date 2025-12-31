@@ -1,87 +1,64 @@
-# app.py — EN->ES como Google Cloud (si hay credenciales) o deep_translator (fallback)
-# - Carga automática de .env (Azure Speech y Google Cloud)
-# - SIN campos de Azure en la barra lateral
-# - Azure TTS: SSML con <sub alias="..."> SOLO en URLs/emails (no dice "punto" al final)
-# - Piper TTS: alternativa local (verbaliza SOLO URL/EMAIL/DOMINIO+RUTA)
-# - Sincroniza audio↔vídeo con ffmpeg
+# app.py
+# EN -> ES (España) con detección automática de credenciales:
+# - Lee AZURE_SPEECH_KEY / AZURE_SPEECH_REGION y gcp_service_account desde st.secrets (o .env)
+# - Google Cloud Translate si hay credenciales; si no, deep_translator fallback
+# - Azure TTS (es-ES) y ajuste exacto de audio al vídeo
+# - ffmpeg portable vía imageio-ffmpeg
 
-import os, re, io, glob, shutil, subprocess, pathlib, platform
-from pathlib import Path
+import os, re, io, glob, shutil, subprocess, pathlib, json, tempfile
 import numpy as np
 import streamlit as st
 from pydub import AudioSegment
+from scipy.io import wavfile
 from urllib.parse import urlparse
-from deep_translator import GoogleTranslator
 
-import tempfile, json
-
-# Carga .env si existe (opcional)
+# ========= 0) Bootstrap de secrets / entorno =========
+# (Carga .env si existe y mapea st.secrets -> variables de entorno ANTES de usar nada)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# Lee secrets sin romper si no existen (local)
 try:
-    _secrets = st.secrets
+    _secrets = st.secrets   # en Streamlit Cloud existe; en local puede no
 except Exception:
     _secrets = {}
 
-# Azure Speech → ENV
+# Azure Speech -> ENV
 if not os.getenv("AZURE_SPEECH_KEY") and _secrets.get("AZURE_SPEECH_KEY"):
     os.environ["AZURE_SPEECH_KEY"] = str(_secrets["AZURE_SPEECH_KEY"])
 if not os.getenv("AZURE_SPEECH_REGION") and _secrets.get("AZURE_SPEECH_REGION"):
     os.environ["AZURE_SPEECH_REGION"] = str(_secrets["AZURE_SPEECH_REGION"])
 
-# Google Cloud Translate → crea JSON temporal y apunta la ruta
+# Google Cloud Translate -> escribe JSON temporal y apunta GOOGLE_APPLICATION_CREDENTIALS
 if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and _secrets.get("gcp_service_account"):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
     tmp.write(json.dumps(dict(_secrets["gcp_service_account"])).encode("utf-8"))
     tmp.close()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
-# --- fin bootstrap ---
 
-# Mapear Secrets 
-if "REMOVED_AZURE_KEY" in st.secrets:
-    os.environ["REMOVED_AZURE_KEY"] = st.secrets["REMOVED_AZURE_KEY"]
-if "REMOVED_AZURE_REGION" in st.secrets:
-    os.environ["REMOVED_AZURE_REGION"] = st.secrets["REMOVED_AZURE_REGION"]
-
-# Google Cloud: 
-if "gcp_service_account" in st.secrets:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    tmp.write(json.dumps(st.secrets["gcp_service_account"]).encode("utf-8"))
-    tmp.close()
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
-
+# ========= 0.1) ffmpeg portable =========
 try:
     import imageio_ffmpeg
     ff = imageio_ffmpeg.get_ffmpeg_exe()
-    os.environ["PATH"] = os.path.dirname(ff) + os.pathsep + os.environ.get("PATH","")
+    os.environ["PATH"] = os.path.dirname(ff) + os.pathsep + os.environ.get("PATH", "")
 except Exception:
     pass
 
-# === Cargar .env automáticamente (mismo dir que este archivo; fallback a find_dotenv) ===
-try:
-    from dotenv import load_dotenv, find_dotenv
-    load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
-    if not Path(".env").exists():
-        load_dotenv(find_dotenv(), override=True)
-except Exception:
-    pass
-
+# ========= 1) Resto de imports que dependen del entorno =========
 import yt_dlp
 import whisper
+from deep_translator import GoogleTranslator
 
-# ===== Azure TTS (opcional) =====
+# Azure Speech SDK (opcional)
 try:
     import azure.cognitiveservices.speech as speechsdk
     AZURE_OK = True
 except Exception:
     AZURE_OK = False
 
-# ---------- Utils ----------
+# ---------- utilidades de sistema / ffprobe ----------
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
@@ -120,7 +97,7 @@ def ensure_video_ok(video_path:str)->str:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return remux if _probe_duration(remux)>0.1 else video_path
 
-# ---------- Descarga / entrada ----------
+# ---------- descarga / entrada ----------
 def _first_url(s:str):
     m=re.search(r'https?://\S+', s or '')
     return m.group(0) if m else None
@@ -128,6 +105,7 @@ def _looks_local(s:str)->bool:
     if not s: return False
     s=s.strip().strip('"').strip("'")
     return pathlib.Path(s).exists()
+
 def download_video(url:str)->str:
     if not _ffmpeg_ok(): raise RuntimeError("ffmpeg no encontrado.")
     formats=[
@@ -156,6 +134,7 @@ def download_video(url:str)->str:
                 return fn
         except Exception as e:
             last=e
+    # fallback pytube
     try:
         from pytube import YouTube
         yt=YouTube(url)
@@ -165,6 +144,7 @@ def download_video(url:str)->str:
         return stream.download(filename=f"{yt.video_id}.mp4")
     except Exception as e2:
         raise RuntimeError(f"Fallo descarga: {last} / {e2}")
+
 def resolve_source(user_in:str)->str:
     s=user_in.strip().strip('"').strip("'")
     if s.lower().startswith(('http://','https://')) or _first_url(s):
@@ -181,12 +161,49 @@ def resolve_source(user_in:str)->str:
         return ensure_video_ok(str(out.resolve()))
     raise RuntimeError("Proporciona URL de YouTube o ruta local válida.")
 
-# ---------- Audio / ASR ----------
+# ---------- audio ----------
 def extract_audio(video:str, out="audio.wav")->str:
     subprocess.run(["ffmpeg","-y","-i",video,"-ac","1","-ar","16000","-vn",
                     "-acodec","pcm_s16le",out],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return out
+
+# ---------- ASR Whisper + normalización ligera de URLs ----------
+def normalize_glued_phrases_en(text:str)->str:
+    if not text: return text
+    text=re.sub(r"you\s*can\s*also\s*sign\s*up\s*for\s*a\s*free\s*trial\s*at",
+                "you can also sign up for a free trial at", text, flags=re.IGNORECASE)
+    text=re.sub(r"youcanalsosignupforafreetrialat",
+                "you can also sign up for a free trial at", text, flags=re.IGNORECASE)
+    text=re.sub(r"sign\s*up","sign up", text, flags=re.IGNORECASE)
+    return text
+
+URL_WORDS = r"(?:dot|period|\.)"
+SLASH_WORDS = r"(?:slash|forward slash|/)"
+HOST_LABEL = r"[A-Za-z0-9-]+(?:\s+[A-Za-z0-9-]+)*"
+URL_HOST_PATH_PATTERN = re.compile(
+    rf"\b({HOST_LABEL})\s*(?:{URL_WORDS})\s*(com|co|org|net|ai|io|dev|app|es|uk|edu|gov|info|biz)\b\s*(?:{SLASH_WORDS})\s*([A-Za-z0-9\-_/%.]+)",
+    re.IGNORECASE
+)
+URL_HOST_ONLY_PATTERN = re.compile(
+    rf"\b({HOST_LABEL})\s*(?:{URL_WORDS})\s*(com|co|org|net|ai|io|dev|app|es|uk|edu|gov|info|biz)\b",
+    re.IGNORECASE
+)
+def _squash(label:str)->str: return re.sub(r"\s+","",label)
+def normalize_english_urls(text:str)->str:
+    if not text: return text
+    def _host_path(m):
+        host=_squash(m.group(1)); tld=m.group(2).lower(); path=m.group(3)
+        path=re.sub(r"\s*/\s*","/", path)
+        return f"{host}.{tld}/{path}"
+    def _host_only(m):
+        host=_squash(m.group(1)); tld=m.group(2).lower()
+        return f"{host}.{tld}"
+    text=URL_HOST_PATH_PATTERN.sub(_host_path, text)
+    text=URL_HOST_ONLY_PATTERN.sub(_host_only, text)
+    text=re.sub(r"\b([A-Za-z0-9-]+)\.\s+(com|co|org|net|ai|io|dev|app|es|uk|edu|gov|info|biz)\b",
+                r"\1.\2", text, flags=re.IGNORECASE)
+    return text
 
 def transcribe_segments(audio:str, model_size='small'):
     model=whisper.load_model(model_size, device='cpu')
@@ -197,46 +214,79 @@ def transcribe_segments(audio:str, model_size='small'):
         no_speech_threshold=0.2, logprob_threshold=-1.0,
         compression_ratio_threshold=2.4
     )
-    full = res.get('text','')
-    return res['segments'], full
+    full = normalize_english_urls(normalize_glued_phrases_en(res.get('text','')))
+    segs = res['segments']
+    for s in segs:
+        t=normalize_english_urls(normalize_glued_phrases_en(s.get('text','')))
+        s['text']=t
+    return segs, full
 
-# ---------- Detección de direcciones ----------
+# ---------- Protección de direcciones + TECH acronyms ----------
 URL_RE   = re.compile(r'(?i)\bhttps?://[^\s]+')
 EMAIL_RE = re.compile(r'(?i)\b[\w\.-]+@[\w\.-]+\.\w+\b')
+DOMAIN_HOST_RE = re.compile(r'(?ix)(?<!://)\b(?![\w\.-]+@)(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b')
 DOMAIN_WITH_PATH_RE = re.compile(
     r'(?ix)(?<!://)\b(?![\w\.-]+@)'
     r'((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})'
     r'(/[^\s\)\]\}\.,;:!?]+)'
 )
+BASE_TECH_TERMS = {
+    "RAG","LLM","GPT","GPU","TPU","API","SDK","SQL","NoSQL","ETL","ELT",
+    "BI","KPI","CI/CD","MLOps","DevOps","RBAC","SSO","IAM","SLA","SLO","K8S","ML","AI","NLP"
+}
+UPPER_TECH = {t.upper() for t in BASE_TECH_TERMS}
+PLACE_PREF="__XTOK_"; PLACE_SUFF="__"
 
-# ---------- Traducción (Google Cloud > deep_translator) ----------
-def translate_google_cloud(texts):
-    from google.cloud import translate_v2 as translate
-    client=translate.Client()
-    if isinstance(texts,str): texts=[texts]
-    outs=[]
-    for t in texts:
-        r=client.translate(t, source_language='en', target_language='es', format_='text')
-        outs.append(r['translatedText'])
-    return outs
+def canonicalize_tech_acronyms(text: str) -> str:
+    if not text: return text
+    def repl(m):
+        core = m.group("core"); suf = m.group("suf") or ""; comp = m.group("comp") or ""
+        core_up = core.upper()
+        if core_up in UPPER_TECH: return core_up + suf + comp
+        return m.group(0)
+    pat = re.compile(r"(?i)(?<![A-Za-z0-9])(?P<core>[A-Za-z]{2,6})(?P<suf>s|es)?(?P<comp>[-_][A-Za-z0-9]+)?(?=[\s\)\]\}},\.;:!?]|$)")
+    return pat.sub(repl, text)
 
-def translate_fallback(texts):
-    gt=GoogleTranslator(source="en", target="es")
-    if isinstance(texts,str): texts=[texts]
-    return [gt.translate(t) if (t or "").strip() else "" for t in texts]
+def compile_tech_regex(terms: set[str], protect_all_caps=True):
+    parts=[]
+    if terms:
+        term_alts=[]
+        for t in sorted(terms, key=len, reverse=True):
+            core=re.escape(t)
+            term_alts.append(rf"(?<![A-Za-z0-9]){core}(?:s|es)?(?:[-_][A-Za-z0-9]+)?(?=[\s\)\]\}},\.;:!?]|$)")
+        parts.append("(?:%s)" % "|".join(term_alts))
+    if protect_all_caps:
+        parts.append(r"(?<![A-Za-z0-9])([A-Z]{2,6})(?:s|es)?(?:[-_][A-Za-z0-9]+)?(?=[\s\)\]\}},\.;:!?]|$)")
+    if not parts: return None
+    return re.compile("(?:" + "|".join(parts) + ")")
 
-def translate_en2es_exact_google(texts):
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        try:
-            return translate_google_cloud(texts)
-        except Exception:
-            pass
-    return translate_fallback(texts)
+def protect_spans_with_types(text: str, tech_re=None):
+    if not text: return text, {}, {}
+    spans=[]
+    def collect(pat, typ):
+        for m in pat.finditer(text):
+            s,e=m.span()
+            if any(s<e2 and e>s2 for s2,e2,_ in spans): continue
+            spans.append((s,e,typ))
+    for pat,typ in [(URL_RE,"url"),(EMAIL_RE,"email"),(DOMAIN_WITH_PATH_RE,"domain_path"),(DOMAIN_HOST_RE,"domain")]:
+        collect(pat,typ)
+    if tech_re is not None:
+        for m in tech_re.finditer(text):
+            s,e=m.span(); frag=text[s:e]
+            if frag.upper()!=frag: continue
+            if any(s<e2 and e>s2 for s2,e2,_ in spans): continue
+            spans.append((s,e,"tech"))
+    if not spans: return text, {}, {}
+    spans.sort()
+    out=[]; last=0; mapping={}; mapping_types={}
+    for idx,(s,e,typ) in enumerate(spans):
+        out.append(text[last:s])
+        tok=f"{PLACE_PREF}{idx}{PLACE_SUFF}"
+        mapping[tok]=text[s:e]; mapping_types[tok]=typ
+        out.append(tok); last=e
+    out.append(text[last:])
+    return "".join(out), mapping, mapping_types
 
-def build_spanish_text(full_en: str) -> str:
-    return translate_en2es_exact_google(full_en)[0]
-
-# ---------- “Forma hablada” para URLs/emails ----------
 def pronounce_host_es(host:str)->str:
     host=host.strip().strip('.,;:!?)]}')
     spoken=[]
@@ -270,160 +320,142 @@ def pronounce_email_es(email:str)->str:
     local=re.sub(r'\s{2,}',' ',local).strip()
     return f"{local} arroba {pronounce_host_es(dom)}"
 
-# ---------- SSML seguro (Azure) ----------
-PAUSE_COMMA_MS = 200
-PAUSE_SEMI_MS  = 260
-PAUSE_COLON_MS = 220
-PAUSE_SENT_MS  = 360
+def to_spoken_spanish_from_raw_address(raw: str) -> str:
+    raw = raw.strip()
+    if re.match(URL_RE, raw): return pronounce_url_es(raw)
+    if re.match(EMAIL_RE, raw): return pronounce_email_es(raw)
+    m = DOMAIN_WITH_PATH_RE.match(raw)
+    if m: return pronounce_url_es(m.group(1) + m.group(2))
+    if re.match(DOMAIN_HOST_RE, raw): return pronounce_host_es(raw)
+    return raw
 
-def _ssml_escape(s: str) -> str:
-    return (s.replace("&", "&amp;")
-             .replace("<", "&lt;")
-             .replace(">", "&gt;")
-             .replace('"', "&quot;")
-             .replace("'", "&apos;"))
-
-def _collect_address_spans(text: str):
-    spans = []
-    for m in URL_RE.finditer(text):
-        spans.append((m.start(), m.end(), "url", text[m.start():m.end()]))
-    for m in EMAIL_RE.finditer(text):
-        spans.append((m.start(), m.end(), "email", text[m.start():m.end()]))
-    for m in DOMAIN_WITH_PATH_RE.finditer(text):
-        spans.append((m.start(), m.end(), "domain_path", text[m.start():m.end()]))
-    spans.sort(key=lambda x: x[0])
-    compact=[]
-    last_e=-1
-    for s,e,t,v in spans:
-        if s>=last_e:
-            compact.append((s,e,t,v)); last_e=e
-    return compact
-
-def _mark_breaks_with_placeholders(s: str) -> str:
-    s = re.sub(r'\s*\n+\s*', ' ', s)
-    s = re.sub(r'\s{2,}', ' ', s).strip()
-    s = re.sub(r',\s*', ',__BRK_COMMA__', s)
-    s = re.sub(r';\s*', ';__BRK_SEMI__', s)
-    s = re.sub(r':\s*', ':__BRK_COLON__', s)
-    s = re.sub(r'([\.!?])\s*', r'\1__BRK_SENT__ ', s)
-    return s
-def _restore_break_placeholders(escaped_text: str) -> str:
-    escaped_text = escaped_text.replace('__BRK_COMMA__', f'<break time="{PAUSE_COMMA_MS}ms"/> ')
-    escaped_text = escaped_text.replace('__BRK_SEMI__',  f'<break time="{PAUSE_SEMI_MS}ms"/> ')
-    escaped_text = escaped_text.replace('__BRK_COLON__', f'<break time="{PAUSE_COLON_MS}ms"/> ')
-    escaped_text = escaped_text.replace('__BRK_SENT__',  f'<break time="{PAUSE_SENT_MS}ms"/> ')
-    return escaped_text
-def _ssml_plain_with_breaks(s: str) -> str:
-    if not s: return ""
-    marked = _mark_breaks_with_placeholders(s)
-    escaped = _ssml_escape(marked)
-    return _restore_break_placeholders(escaped)
-
-def _build_ssml_with_address_subs(full_text_es: str) -> str:
-    if not full_text_es:
-        return "<s></s>"
-    text = full_text_es
-    spans = _collect_address_spans(text)
-    if not spans:
-        return f"<s>{_ssml_plain_with_breaks(text)}</s>"
-    out = []; last=0
-    for (s,e,typ,frag) in spans:
-        if s>last: out.append(_ssml_plain_with_breaks(text[last:s]))
-        alias = pronounce_email_es(frag) if typ=="email" else pronounce_url_es(frag)
-        out.append(f'<sub alias="{_ssml_escape(alias)}">{_ssml_escape(frag)}</sub>')
-        last=e
-    if last<len(text): out.append(_ssml_plain_with_breaks(text[last:]))
-    return "<s>"+"".join(out)+"</s>"
-
-# ---------- Piper (texto plano a partir del SSML anterior) ----------
-BREAKER = re.compile(r'<break[^>]*time="(\d+)ms"[^>]*/>')
-def ssml_to_punct_for_local(ssml: str) -> str:
-    if not ssml: return ""
-    def repl(m):
-        t = int(m.group(1))
-        if t >= 330: return '. '
-        if t >= 250: return '; '
-        if t >= 180: return ', '
-        return ' '
-    txt = BREAKER.sub(repl, ssml)
-    txt = re.sub(r'</?s>', '', txt)
-    txt = re.sub(r'\s{2,}', ' ', txt)
-    return txt.strip()
-
-def speakify_addresses_text_piper(text: str) -> str:
-    def repl_url(m):   return pronounce_url_es(m.group(0))
-    def repl_mail(m):  return pronounce_email_es(m.group(0))
-    def repl_path(m):  return pronounce_url_es(m.group(0))
-    text = URL_RE.sub(repl_url, text)
-    text = EMAIL_RE.sub(repl_mail, text)
-    text = DOMAIN_WITH_PATH_RE.sub(repl_path, text)
+def unprotect_addresses_as_spoken(text: str, mapping: dict, mapping_types: dict) -> str:
+    if not mapping: return text
+    for token, original in sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True):
+        typ = mapping_types.get(token, "")
+        if typ in {"url","email","domain_path","domain"}:
+            text = text.replace(token, to_spoken_spanish_from_raw_address(original))
+        else:
+            text = text.replace(token, original)  # TECH -> exacto
     return re.sub(r'\s{2,}', ' ', text).strip()
 
-def prepare_text_for_piper(es_text: str) -> str:
-    spoken = speakify_addresses_text_piper(es_text)
-    ssml = _build_ssml_with_address_subs(spoken)
-    return ssml_to_punct_for_local(ssml)
+# ---------- Traducción EN->ES ----------
+def translate_google_cloud(texts):
+    from google.cloud import translate_v2 as translate
+    client=translate.Client()
+    if isinstance(texts,str): texts=[texts]
+    outs=[]
+    for t in texts:
+        t=t or ""
+        if not t.strip(): outs.append(""); continue
+        parts=[]; chunk=[]; total=0
+        for w in t.split():
+            lw=len(w)+1
+            if total+lw>4500: parts.append(" ".join(chunk)); chunk=[w]; total=lw
+            else: chunk.append(w); total+=lw
+        if chunk: parts.append(" ".join(chunk))
+        segs=[]
+        for p in parts:
+            r=client.translate(p, source_language='en', target_language='es', format_='text')
+            segs.append(r['translatedText'])
+        outs.append(" ".join(segs))
+    return outs
 
-# ---------- TTS ----------
-IS_WIN = platform.system() == "Windows"
-PIPER_BIN_DEFAULT = "./piper/piper.exe" if IS_WIN else "./piper/piper"
-PIPER_BIN   = os.getenv("PIPER_BIN",   PIPER_BIN_DEFAULT)
-PIPER_VOICE = os.getenv("PIPER_VOICE", "./voices/es_ES-mls_10246-low.onnx")
-PIPER_RATE  = os.getenv("PIPER_RATE",  "22050")
+def translate_google_fallback(texts):
+    gt=GoogleTranslator(source="en", target="es")
+    if isinstance(texts,str): texts=[texts]
+    outs=[]
+    for t in texts:
+        t=(t or "").strip()
+        if not t: outs.append(""); continue
+        parts=[]; chunk=[]; total=0
+        for w in t.split():
+            lw=len(w)+1
+            if total+lw>4500: parts.append(" ".join(chunk)); chunk=[w]; total=lw
+            else: chunk.append(w); total+=lw
+        if chunk: parts.append(" ".join(chunk))
+        outs.append(" ".join(gt.translate(p) for p in parts if p.strip()))
+    return outs
 
-def has_piper() -> bool:
-    return (shutil.which(PIPER_BIN) is not None) or os.path.exists(PIPER_BIN)
+def translate_en2es(texts):
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        try: return translate_google_cloud(texts)
+        except Exception: return translate_google_fallback(texts)
+    return translate_google_fallback(texts)
 
-def tts_piper(text: str, outfile="tts_es.wav") -> str:
-    if not has_piper() or not os.path.exists(PIPER_VOICE):
-        raise RuntimeError("Piper no disponible. Configura PIPER_BIN y PIPER_VOICE.")
-    prepared = prepare_text_for_piper(text)
-    cmd = [PIPER_BIN, "-m", PIPER_VOICE, "-q", "50", "-s", str(PIPER_RATE), "-f", outfile]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    proc.communicate(input=prepared.encode("utf-8"))
-    if proc.returncode != 0 or not os.path.exists(outfile):
-        raise RuntimeError("Piper falló generando TTS.")
-    return outfile
+# ---------- Post-edición ES ----------
+def clean_spaces(s:str)->str:
+    s=re.sub(r'\s*\n+\s*',' ', s); s=re.sub(r'\s{2,}',' ', s); return s.strip()
+def spain_register(s:str)->str:
+    rules=[
+        (r'\bles voy a mostrar\b','os voy a enseñar'),
+        (r'\bles mostraré\b','os voy a enseñar'),
+        (r'\bimplementar\b','poner en marcha'),
+        (r'\bustedes\b','vosotros'),
+        (r'\bUstedes\b','Vosotros'),
+        (r'\bles (muestro|enseño|explico|presento)\b', r'os \1'),
+    ]
+    out=s
+    for pat,rep in rules: out=re.sub(pat,rep,out,flags=re.IGNORECASE)
+    return out
+def fix_spanish_intro(es_text:str)->str:
+    if not es_text: return es_text
+    es_text = re.sub(
+        r'(?i)\b(?:aquí\s+([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚñ]+)|([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚñ]+)\s+aquí)\b',
+        lambda m: f"soy {m.group(1) or m.group(2)}",
+        es_text
+    )
+    es_text = re.sub(
+        r'(?i)\b(hola(?: a todos| a todas| a todos y todas| a [\w\s]+)?),\s*([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚñ]+)\s+aquí\b',
+        lambda m: f"{m.group(1)}, soy {m.group(2)}",
+        es_text
+    )
+    es_text = re.sub(
+        r'(^|\.\s+|\!\s+|\?\s+)soy\s+([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚñ]+)',
+        lambda m: f"{m.group(1)}Soy {m.group(2)}",
+        es_text
+    )
+    return es_text
+def post_edit_es(s:str)->str:
+    if not s: return s
+    s=clean_spaces(s); s=spain_register(s); s=fix_spanish_intro(s); s=clean_spaces(s)
+    return s
 
+# ---------- Azure TTS ----------
 def get_azure_creds():
-    key=os.getenv("REMOVED_AZURE_KEY")
-    region=os.getenv("REMOVED_AZURE_REGION")
+    key=os.getenv("AZURE_SPEECH_KEY")
+    region=os.getenv("AZURE_SPEECH_REGION")
     return key, region
 
-def tts_azure(text_es: str, voice="es-ES-DarioNeural", outfile="tts_es.wav", rate_pct=-6):
+def tts_azure(text:str, voice="es-ES-DarioNeural", outfile="tts_es.wav", rate_pct=-4):
     if not AZURE_OK: raise RuntimeError("azure-cognitiveservices-speech no instalado.")
-    key, region = get_azure_creds()
-    if not key or not region: raise RuntimeError("Faltan REMOVED_AZURE_KEY / REMOVED_AZURE_REGION")
-    body = _build_ssml_with_address_subs(text_es)
-    ssml = f"""<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis"
-    xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="es-ES">
-      <voice name="{voice}">
-        <mstts:express-as style="newscast-casual">
-          <prosody rate="{rate_pct:+d}%">{body}</prosody>
-        </mstts:express-as>
-      </voice>
-    </speak>"""
-    cfg = speechsdk.SpeechConfig(subscription=key, region=region)
+    key,region=get_azure_creds()
+    if not key or not region: raise RuntimeError("Faltan AZURE_SPEECH_KEY / AZURE_SPEECH_REGION")
+    text=(text or "").strip()
+    if not text:
+        wavfile.write(outfile, 24000, np.zeros(int(0.05*24000), dtype=np.int16))
+        return outfile
+    rate=f"{rate_pct:+d}%"
+    ssml=f"""<speak version="1.0" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="es-ES">
+<voice name="{voice}">
+<mstts:express-as style="newscast-casual">
+<prosody rate="{rate}">{text}</prosody>
+</mstts:express-as>
+</voice>
+</speak>"""
+    cfg=speechsdk.SpeechConfig(subscription=key, region=region)
     cfg.set_speech_synthesis_output_format(
         speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
     )
-    synth = speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=None)
-    res = synth.speak_ssml_async(ssml).get()
-    if res.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+    synth=speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=None)
+    res=synth.speak_ssml_async(ssml).get()
+    if res.reason!=speechsdk.ResultReason.SynthesizingAudioCompleted:
         raise RuntimeError(f"Azure TTS falló: {res.reason}")
-    raw = bytes(res.audio_data)
-    AudioSegment.from_file(io.BytesIO(raw), format="wav").export(outfile, format="wav")
+    audio=bytes(res.audio_data)
+    AudioSegment.from_file(io.BytesIO(audio), format="wav").export(outfile, format="wav")
     return outfile
 
-def synthesize_es(text_es: str, voice="es-ES-DarioNeural", outfile="tts_es.wav") -> str:
-    key, region = get_azure_creds()
-    if AZURE_OK and key and region:
-        return tts_azure(text_es, voice=voice, outfile=outfile, rate_pct=-6)
-    else:
-        return tts_piper(text_es, outfile=outfile)
-
-# ---------- Sincronización ----------
+# ---------- Ajuste exacto audio-vídeo ----------
 def _atempo_chain(factor:float):
     if factor<=0: factor=1.0
     chain=[]; f=factor
@@ -432,6 +464,7 @@ def _atempo_chain(factor:float):
         chain.append(f"atempo={step}"); f=f/step
     chain.append(f"atempo={f}")
     return ",".join(chain)
+
 def fit_audio_to_video(video:str, audio_in:str, audio_out:str)->str:
     v=_probe_duration(video); a=_probe_duration(audio_in)
     if v<=0: video=ensure_video_ok(video); v=_probe_duration(video)
@@ -453,20 +486,32 @@ def fit_audio_to_video(video:str, audio_in:str, audio_out:str)->str:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     shutil.move(audio_out+".fix.wav", audio_out)
     return audio_out
+
 def mux_video_audio(video:str, audio:str, out="video_doblado.mp4")->str:
     subprocess.run(['ffmpeg','-y','-i',video,'-i',audio,'-map','0:v:0','-map','1:a:0',
                     '-c:v','copy','-c:a','aac','-b:a','192k','-movflags','+faststart', out],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return out
 
-# ---------- UI ----------
-st.title("🎬 Dobador de videos EN→ES")
+# ---------- Construcción texto español (sin toggles) ----------
+def build_spanish_text(full_en: str) -> str:
+    norm_en = canonicalize_tech_acronyms(full_en or "")
+    tech_re = compile_tech_regex(set(BASE_TECH_TERMS), protect_all_caps=True)
+    prot, mapping, mapping_types = protect_spans_with_types(norm_en, tech_re=tech_re)
+    es = translate_en2es(prot)[0]
+    es = unprotect_addresses_as_spoken(es, mapping, mapping_types)
+    es = post_edit_es(es)
+    return es
 
+# ============================ UI ============================
+st.set_page_config(page_title="Doblador EN→ES", page_icon="🎬", layout="centered")
+st.title("🎬 Doblad**or** de videos EN→ES")  # pequeño guiño
+
+# Estado de motores
+translator_active = "Google Cloud" if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") else "deep_translator (fallback)"
 has_azure = bool(os.getenv("AZURE_SPEECH_KEY"))
 azure_region = os.getenv("AZURE_SPEECH_REGION") or "—"
-
-engine = "Google Cloud" if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") else "deep_translator (fallback)"
-st.caption(f"Motor de traducción activo: {engine}  |  Azure KEY: {'✔️' if os.getenv('REMOVED_AZURE_KEY') else '❌'}  |  Región: {os.getenv('REMOVED_AZURE_REGION') or '—'}")
+st.caption(f"Motor de traducción activo: **{translator_active}** | Azure KEY: {'✅' if has_azure else '❌'} | Región: {azure_region}")
 
 source = st.text_input("🔗 URL de YouTube o 📁 ruta local al vídeo")
 accion = st.radio("Acción", ["Obtener el texto en inglés","Obtener la traducción a español","Hacer el doblaje del video"], index=2)
@@ -482,52 +527,56 @@ if st.button("Procesar"):
     if not source:
         st.error("Introduce una URL o ruta.")
     else:
-        with st.spinner("Cargando vídeo y transcribiendo..."):
-            video = resolve_source(source)
-            audio_wav = extract_audio(video)
-            segments, full_en = transcribe_segments(audio_wav, model_size=model)
+        try:
+            with st.spinner("Cargando vídeo y transcribiendo..."):
+                video = resolve_source(source)
+                audio_wav = extract_audio(video)
+                segments, full_en = transcribe_segments(audio_wav, model_size=model)
 
-        if accion == "Obtener el texto en inglés":
-            st.success("✅ Transcripción (EN) lista.")
-            st.download_button("⬇️ Descargar EN (.txt)", (full_en or "").encode("utf-8"),
-                               file_name="transcripcion_en.txt", mime="text/plain")
-
-        elif accion == "Obtener la traducción a español":
-            with st.spinner("Traduciendo…"):
-                full_es = build_spanish_text(full_en)
-            st.success("✅ Traducción (ES) lista.")
-            c1,c2=st.columns(2)
-            with c1:
-                st.download_button("⬇️ EN (.txt)", (full_en or "").encode("utf-8"),
+            if accion == "Obtener el texto en inglés":
+                st.success("✅ Transcripción (EN) lista.")
+                st.download_button("⬇️ Descargar EN (.txt)", (full_en or "").encode("utf-8"),
                                    file_name="transcripcion_en.txt", mime="text/plain")
-            with c2:
-                st.download_button("⬇️ ES (.txt)", (full_es or "").encode("utf-8"),
-                                   file_name="traduccion_es.txt", mime="text/plain")
 
-            if st.button("Doblaje ahora"):
-                try:
+            elif accion == "Obtener la traducción a español":
+                with st.spinner("Traduciendo y aplicando reglas..."):
+                    full_es = build_spanish_text(full_en)
+                st.success("✅ Traducción (ES) lista.")
+                c1,c2=st.columns(2)
+                with c1:
+                    st.download_button("⬇️ EN (.txt)", (full_en or "").encode("utf-8"),
+                                       file_name="transcripcion_en.txt", mime="text/plain")
+                with c2:
+                    st.download_button("⬇️ ES (.txt)", (full_es or "").encode("utf-8"),
+                                       file_name="traduccion_es.txt", mime="text/plain")
+
+                if AZURE_OK and has_azure:
+                    if st.button("Doblaje ahora con Azure TTS"):
+                        with st.spinner("Sintetizando y ajustando al tiempo del vídeo..."):
+                            wav = tts_azure(full_es, voice=voice, outfile="tts_es.wav", rate_pct=-4)
+                            fit = fit_audio_to_video(video, wav, "tts_fit.wav")
+                            out = mux_video_audio(video, fit, "video_doblado.mp4")
+                        st.success("✅ Doblaje listo")
+                        st.video(out)
+                        st.download_button("⬇️ Descargar video doblado", open(out,"rb"),
+                                           file_name="video_doblado.mp4")
+                else:
+                    st.info("Para doblar directamente aquí, configura AZURE_SPEECH_KEY y AZURE_SPEECH_REGION en *Secrets*.")
+
+            else:  # Hacer el doblaje del video
+                with st.spinner("Traduciendo y aplicando reglas..."):
+                    full_es = build_spanish_text(full_en)
+                if not (AZURE_OK and has_azure):
+                    st.error("Falta Azure Speech (SDK o claves). Configura *Secrets* y vuelve a intentar.")
+                else:
                     with st.spinner("Sintetizando y ajustando al tiempo del vídeo..."):
-                        wav = synthesize_es(full_es, voice=voice, outfile="tts_es.wav")
+                        wav = tts_azure(full_es, voice=voice, outfile="tts_es.wav", rate_pct=-4)
                         fit = fit_audio_to_video(video, wav, "tts_fit.wav")
                         out = mux_video_audio(video, fit, "video_doblado.mp4")
                     st.success("✅ Doblaje listo")
                     st.video(out)
                     st.download_button("⬇️ Descargar video doblado", open(out,"rb"),
                                        file_name="video_doblado.mp4")
-                except Exception as e:
-                    st.error(str(e))
 
-        else:  # Hacer el doblaje del video
-            with st.spinner("Traduciendo…"):
-                full_es = build_spanish_text(full_en)
-            try:
-                with st.spinner("Sintetizando y ajustando al tiempo del vídeo..."):
-                    wav = synthesize_es(full_es, voice=voice, outfile="tts_es.wav")
-                    fit = fit_audio_to_video(video, wav, "tts_fit.wav")
-                    out = mux_video_audio(video, fit, "video_doblado.mp4")
-                st.success("✅ Doblaje listo")
-                st.video(out)
-                st.download_button("⬇️ Descargar video doblado", open(out,"rb"),
-                                   file_name="video_doblado.mp4")
-            except Exception as e:
-                st.error(str(e))
+        except Exception as e:
+            st.error(str(e))
