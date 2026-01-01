@@ -515,6 +515,7 @@ def mux_video_audio(video: str, audio: str, out="video_doblado.mp4") -> str:
 # ---------- UI ----------
 st.set_page_config(page_title="Doblador EN→ES", page_icon="🎬", layout="centered")
 st.title("🎬 Doblador EN→ES (by Miguel Ángel Gómez Ortiz)")
+st.caption("por Miguel Ángel Gómez Ortiz")
 
 st.markdown("**Entrada de vídeo** (recomendado: subir archivo o usar enlace directo).")
 col_u, col_o = st.columns([2,1])
