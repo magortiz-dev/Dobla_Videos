@@ -10,9 +10,6 @@ from pydub import AudioSegment
 from scipy.io import wavfile
 from deep_translator import GoogleTranslator
 
-# ---------- ASR ----------
-import whisper
-
 # ---------- TTS Azure ----------
 try:
     import azure.cognitiveservices.speech as speechsdk
@@ -28,26 +25,20 @@ FFPROBE_BIN = None
 FFMPEG_BIN = None
 
 def _setup_ffmpeg():
-    """Intenta usar ffmpeg del sistema; si no existe, usa el portátil de imageio-ffmpeg."""
     global FFMPEG_BIN
     sys_ffmpeg = shutil.which("ffmpeg")
     if sys_ffmpeg:
         FFMPEG_BIN = sys_ffmpeg
     else:
-        # Fallback portátil
         import imageio_ffmpeg
         FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
-        # Asegura PATH para librerías que llaman por nombre
-        os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
-        os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
-
+        os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH","")
+        os.environ["FFMPEG_BINARY"] = FFMPEG_BIN  # por si alguna lib lo respeta
     # Registrar en PyDub
     AudioSegment.converter = FFMPEG_BIN
 
 def _ffmpeg_ok():
-    import shutil as _sh
-    # ✅ usa FFMPEG_BIN correcto, no "_BIN"
-    return bool(FFMPEG_BIN) or (_sh.which("ffmpeg") is not None)
+    return bool(FFMPEG_BIN) or (shutil.which("ffmpeg") is not None)
 
 _setup_ffmpeg()
 
@@ -288,18 +279,45 @@ def resolve_source(user_in: str, uploaded_path: str | None) -> str:
     raise RuntimeError("Entrada no válida. Sube un archivo o pega una URL directa/YouTube.")
 
 # ---------- Audio / ASR / Traducción / TTS ----------
+import whisper
+
 def extract_audio(video: str, out="audio.wav") -> str:
-    subprocess.run([FFMPEG_BIN or "ffmpeg","-y","-i",video,"-ac","1","-ar","16000","-vn",
-                    "-acodec","pcm_s16le", out],
+    subprocess.run([FFMPEG_BIN, "-y", "-i", video, "-ac", "1", "-ar", "16000", "-vn",
+                    "-acodec", "pcm_s16le", out],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return out
 
-def transcribe_segments(audio: str, model_size='small'):
-    model = whisper.load_model(model_size, device='cpu')
-    res = model.transcribe(audio, language='en', task='transcribe',
-                           temperature=0.0, best_of=5, beam_size=5,
-                           condition_on_previous_text=False, fp16=False)
-    return res.get('segments', []), res.get('text', '')
+def transcribe_segments(audio_wav_path: str, model_size: str = "small"):
+    """
+    Carga el WAV ya decodificado (16 kHz mono PCM) con scipy,
+    lo convierte a float32 [-1,1] y se lo pasa a Whisper directamente.
+    Así evitamos que Whisper invoque 'ffmpeg'.
+    """
+    sr, pcm = wavfile.read(audio_wav_path)  # int16
+    if pcm.ndim > 1:
+        pcm = pcm[:, 0]
+    # si por cualquier motivo no es 16k, remuestrea con nuestro ffmpeg portátil
+    if sr != 16000:
+        fixed = audio_wav_path + ".16k.wav"
+        subprocess.run([FFMPEG_BIN, "-y", "-i", audio_wav_path, "-ac", "1", "-ar", "16000",
+                        "-acodec", "pcm_s16le", fixed],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        sr, pcm = wavfile.read(fixed)
+
+    audio = pcm.astype(np.float32) / 32768.0  # a rango [-1, 1]
+
+    model = whisper.load_model(model_size, device="cpu")
+    result = model.transcribe(
+        audio,                    # <- pasamos ndarray, no ruta
+        language="en",
+        task="transcribe",
+        temperature=0.0,
+        best_of=5,
+        beam_size=5,
+        condition_on_previous_text=False,
+        fp16=False
+    )
+    return result.get("segments", []), result.get("text", "")
 
 def translate_google_cloud(texts):
     from google.cloud import translate_v2 as translate
