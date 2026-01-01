@@ -24,42 +24,32 @@ except Exception:
 import yt_dlp
 
 # ---------- Preferir ffmpeg del sistema; fallback a imageio-ffmpeg ----------
-FFMPEG_BIN = None
 FFPROBE_BIN = None
-
 FFMPEG_BIN = None
 
-def force_ffmpeg():
+def _setup_ffmpeg():
+    """Intenta usar ffmpeg del sistema; si no existe, usa el portátil de imageio-ffmpeg."""
     global FFMPEG_BIN
-    # 1) Intenta sistema
     sys_ffmpeg = shutil.which("ffmpeg")
     if sys_ffmpeg:
         FFMPEG_BIN = sys_ffmpeg
     else:
-        # 2) Fallback a imageio-ffmpeg
-        try:
-            import imageio_ffmpeg
-            FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
-            # asegúralo en PATH por si libs lo buscan por nombre
-            os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
-            os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
-        except Exception as e:
-            raise RuntimeError(
-                "ffmpeg no encontrado y no se pudo cargar imageio-ffmpeg. "
-                "Asegúrate de tener 'imageio-ffmpeg' en requirements.txt."
-            ) from e
+        # Fallback portátil
+        import imageio_ffmpeg
+        FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+        # Asegura PATH para librerías que llaman por nombre
+        os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
+        os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
 
-    # Registrar rutas en PyDub
+    # Registrar en PyDub
     AudioSegment.converter = FFMPEG_BIN
-    # ffprobe puede no existir: PyDub no lo requiere para exportar/leer si converter está bien
-    # Si lo tienes instalado, puedes añadir:
-    # AudioSegment.ffprobe = shutil.which("ffprobe")
-
-force_ffmpeg()
 
 def _ffmpeg_ok():
     import shutil as _sh
-    return bool(_BIN) or _sh.which("") is not None
+    # ✅ usa FFMPEG_BIN correcto, no "_BIN"
+    return bool(FFMPEG_BIN) or (_sh.which("ffmpeg") is not None)
+
+_setup_ffmpeg()
 
 def _to_float(s: str) -> float:
     s = (s or "").strip().replace(",", ".")
