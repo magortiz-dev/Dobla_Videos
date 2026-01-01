@@ -344,13 +344,13 @@ def get_azure_creds():
 
 # --- Constantes de sincro fina / clústeres ---
 SYNC_OFFSET_MS       = 120   # retardo global (evitar que la voz se adelante)
-JOIN_GAP_MS          = 350   # si la separación entre segmentos es <= esto, se pueden unir
-CLUSTER_MAX_MS       = 9000  # no generar clústeres demasiado largos
+JOIN_GAP_MS          = 475   # si la separación entre segmentos es <= esto, se pueden unir (inicial 350)
+CLUSTER_MAX_MS       = 11000  # no generar clústeres demasiado largos (inicial (9000)
 GUARD_MS             = 30    # separación mínima entre clústeres
 TAIL_MARGIN_MS       = 60    # no ocupar el final exacto del último seg de clúster
 MIN_WINDOW_MS        = 300   # mínima ventana de clúster
 RATE_MIN_PCT         = -12   # hasta 12% más lento como máx (evitar voz pastosa)
-RATE_MAX_PCT         = +25   # hasta 25% más rápido como máx
+RATE_MAX_PCT         = +20   # hasta 25% más rápido como máx (inicial +25)
 ATEMPO_LAST_RESORT   = 1.20  # compresión ligera final (máx) si aún no cabe
 
 SENT_END_RE = re.compile(r'[.!?…:;]\s*$', re.UNICODE)
