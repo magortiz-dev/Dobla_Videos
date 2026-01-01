@@ -1,6 +1,7 @@
 # app.py — Entrada estable (archivo/Drive/Dropbox/OneDrive/HTTP) + YouTube plan C
 # Traducción Google Cloud (si hay credenciales) o fallback, TTS Azure (es-ES),
-# sincronía exacta audio↔vídeo, cookies/proxy desde st.secrets para yt-dlp.
+# sincronía exacta audio↔vídeo por SEGMENTOS (ventanas estrictas), cookies/proxy
+# desde st.secrets para yt-dlp.
 
 import os, re, io, glob, shutil, tempfile, subprocess, pathlib, json, time
 import requests
@@ -241,8 +242,6 @@ def download_video_stable(url: str) -> str:
 
 def download_youtube(url: str) -> str:
     """Plan C para YouTube. Usa cookies/proxy si están en Secrets/ENV."""
-    if not __ok():
-        raise RuntimeError(" no encontrado.")
     ydl_base = {
         "outtmpl": "%(id)s.%(ext)s",
         "quiet": True,
@@ -431,6 +430,25 @@ def translate_en2es(text: str) -> str:
             pass
     return translate_fallback(text)[0]
 
+# --- NUEVO: traducción por lista (para segmentos) ---
+def translate_list_en2es(texts: list[str]) -> list[str]:
+    has_gcp_env = bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+    if not has_gcp_env:
+        try:
+            svc = st.secrets["gcp_service_account"]
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w", encoding="utf-8")
+            json.dump(dict(svc), tf); tf.close()
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tf.name
+            has_gcp_env = True
+        except Exception:
+            has_gcp_env = False
+    if has_gcp_env:
+        try:
+            return translate_google_cloud(texts)
+        except Exception:
+            pass
+    return translate_fallback(texts)
+
 def get_azure_creds():
     # lee de ENV o de st.secrets (sin UI)
     key = os.getenv("AZURE_SPEECH_KEY")
@@ -473,6 +491,7 @@ def tts_azure(text: str, voice="es-ES-DarioNeural", outfile="tts_es.wav", rate_p
     AudioSegment.from_file(io.BytesIO(audio), format="wav").export(outfile, format="wav")
     return outfile
 
+# --- Ajuste global clásico (se mantiene por compatibilidad) ---
 def _atempo_chain(factor: float):
     if factor <= 0: factor = 1.0
     chain=[]; f=factor
@@ -511,6 +530,147 @@ def mux_video_audio(video: str, audio: str, out="video_doblado.mp4") -> str:
                     "-c:a","aac","-b:a","192k","-movflags","+faststart", out],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return out
+
+
+# =======================
+#     NUEVA SINCRO PRO
+# =======================
+
+# --- Constantes de sincro fina ---
+SYNC_OFFSET_MS      = 150   # retardo global para que el audio NO vaya por delante
+GUARD_MS            = 60    # margen entre segmentos
+TAIL_MARGIN_MS      = 80    # no ocupar el final exacto del segmento Whisper
+MIN_WINDOW_MS       = 220   # ventana mínima por segmento
+MAX_SPEEDUP_FACTOR  = 1.35  # compresión máxima permitida con atempo
+
+def _ffmpeg_time_compress(in_wav: str, out_wav: str, factor: float):
+    """Comprime tiempo con atempo (factor>1: más rápido)."""
+    filt = _atempo_chain(factor)
+    subprocess.run([FFMPEG_BIN, "-y", "-i", in_wav, "-filter:a", filt, out_wav],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+def tts_azure_segment(text: str, voice: str, outfile: str, rate_pct: int = -4) -> str:
+    """TTS Azure para UNA frase/segmento."""
+    if not AZURE_OK:
+        raise RuntimeError("azure-cognitiveservices-speech no instalado.")
+    key, region = get_azure_creds()
+    if not key or not region:
+        raise RuntimeError("Faltan AZURE_SPEECH_KEY / AZURE_SPEECH_REGION")
+    txt = (text or "").strip()
+    if not txt:
+        wavfile.write(outfile, 24000, np.zeros(int(0.05*24000), dtype=np.int16))
+        return outfile
+
+    rate = f"{rate_pct:+d}%"
+    ssml = f"""<speak version="1.0" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="es-ES">
+<voice name="{voice}">
+<mstts:express-as style="newscast-casual">
+<prosody rate="{rate}">{txt}</prosody>
+</mstts:express-as>
+</voice>
+</speak>"""
+
+    cfg = speechsdk.SpeechConfig(subscription=key, region=region)
+    cfg.set_speech_synthesis_output_format(
+        speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
+    )
+    synth = speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=None)
+    res = synth.speak_ssml_async(ssml).get()
+    if res.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+        raise RuntimeError(f"Azure TTS falló: {res.reason}")
+    audio = bytes(res.audio_data)
+    AudioSegment.from_file(io.BytesIO(audio), format="wav").export(outfile, format="wav")
+    return outfile
+
+def build_dubbed_audio_strict(video_path: str,
+                              segments_en: list[dict],
+                              translations_es: list[str],
+                              voice: str,
+                              offset_ms: int = SYNC_OFFSET_MS,
+                              guard_ms: int = GUARD_MS,
+                              tail_margin_ms: int = TAIL_MARGIN_MS,
+                              min_window_ms: int = MIN_WINDOW_MS,
+                              max_speedup: float = MAX_SPEEDUP_FACTOR,
+                              out_wav: str = "tts_timeline.wav") -> str:
+    """
+    Coloca cada TTS en su ventana exacta:
+      - start_real = start_whisper + offset
+      - end_allowed = min(end_whisper - tail_margin, next_start + offset - guard)
+      - si TTS > ventana => atempo (hasta max_speedup) y/o recorte suave
+      - si TTS < ventana => rellenar con silencio (evita voz pastosa)
+      - sin solapes, y recorte/pad final al tamaño exacto del vídeo
+    """
+    if not segments_en:
+        raise RuntimeError("No hay segmentos de Whisper.")
+    if len(translations_es) != len(segments_en):
+        raise RuntimeError("Desajuste segments↔translations.")
+
+    video_ms = int(_probe_duration(video_path) * 1000)
+    if video_ms <= 0:
+        fixed = ensure_video_ok(video_path)
+        video_ms = int(_probe_duration(fixed) * 1000)
+        if video_ms <= 0:
+            raise RuntimeError("No se pudo medir la duración del vídeo.")
+
+    final = AudioSegment.silent(duration=video_ms + 200)
+
+    for i, (seg, text_es) in enumerate(zip(segments_en, translations_es)):
+        start_nom = int(float(seg["start"]) * 1000) + offset_ms
+        end_nom   = int(float(seg["end"])   * 1000)
+
+        if i + 1 < len(segments_en):
+            next_start = int(float(segments_en[i+1]["start"]) * 1000) + offset_ms
+        else:
+            next_start = video_ms
+
+        place_ms = max(0, start_nom)
+        end_allowed = min(end_nom - tail_margin_ms, next_start - guard_ms)
+        if end_allowed < place_ms + min_window_ms:
+            end_allowed = place_ms + min_window_ms
+        if end_allowed > video_ms:
+            end_allowed = video_ms
+
+        window_ms = max(100, end_allowed - place_ms)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf:
+            seg_wav = tf.name
+        tts_azure_segment(text_es, voice=voice, outfile=seg_wav, rate_pct=-4)
+        speech = AudioSegment.from_file(seg_wav)
+        dur_ms = len(speech)
+
+        if dur_ms > window_ms:
+            factor = dur_ms / float(window_ms)
+            if factor > 1.0:
+                if factor > max_speedup:
+                    factor = max_speedup
+                adj = seg_wav.replace(".wav", "_adj.wav")
+                _ffmpeg_time_compress(seg_wav, adj, factor)
+                os.remove(seg_wav)
+                seg_wav = adj
+                speech = AudioSegment.from_file(seg_wav)
+                dur_ms = len(speech)
+            if dur_ms > window_ms:  # por seguridad, recorta
+                speech = speech[:window_ms]
+                dur_ms = len(speech)
+        elif dur_ms < window_ms:
+            speech = speech + AudioSegment.silent(duration=(window_ms - dur_ms))
+            dur_ms = len(speech)
+
+        final = final.overlay(speech, position=place_ms)
+
+        try:
+            os.remove(seg_wav)
+        except Exception:
+            pass
+
+    if len(final) > video_ms:
+        final = final[:video_ms]
+    elif len(final) < video_ms:
+        final = final + AudioSegment.silent(duration=(video_ms - len(final)))
+
+    final.export(out_wav, format="wav")
+    return out_wav
+
 
 # ---------- UI ----------
 st.set_page_config(page_title="Doblador EN→ES", page_icon="🎬", layout="centered")
@@ -565,27 +725,42 @@ if st.button("Procesar"):
             with c2:
                 st.download_button("⬇️ ES (.txt)", (full_es or "").encode("utf-8"),
                                    file_name="traduccion_es.txt", mime="text/plain")
+
+            # También permitimos doblaje segmentado directamente desde aquí
             if AZURE_OK and (os.getenv("AZURE_SPEECH_KEY") or st.secrets.get("AZURE_SPEECH_KEY", None)):
-                if st.button("Doblaje ahora con Azure TTS"):
-                    with st.spinner("Sintetizando y ajustando al tiempo del vídeo..."):
-                        wav = tts_azure(full_es, voice=voice, outfile="tts_es.wav", rate_pct=-4)
-                        fit = fit_audio_to_video(video, wav, "tts_fit.wav")
-                        out = mux_video_audio(video, fit, "video_doblado.mp4")
+                if st.button("Doblaje segmentado (recomendado)"):
+                    with st.spinner("Generando doblaje segmentado y sincronizado..."):
+                        texts_en = [ (s.get("text") or "").strip() for s in segments ]
+                        texts_es = translate_list_en2es(texts_en)
+                        wav_timeline = build_dubbed_audio_strict(
+                            video_path = video,
+                            segments_en = segments,
+                            translations_es = texts_es,
+                            voice = voice,
+                            out_wav = "tts_timeline.wav"
+                        )
+                        out = mux_video_audio(video, wav_timeline, "video_doblado.mp4")
                     st.success("✅ Doblaje listo")
                     st.video(out)
                     st.download_button("⬇️ Descargar video doblado", open(out,"rb"),
                                        file_name="video_doblado.mp4")
 
-        else:  # Hacer el doblaje del video
-            with st.spinner("Traduciendo con Google..."):
-                full_es = translate_en2es(full_en)
+        else:  # Hacer el doblaje del video (segmentado por defecto)
+            with st.spinner("Traduciendo con Google por segmentos..."):
+                texts_en = [ (s.get("text") or "").strip() for s in segments ]
+                texts_es = translate_list_en2es(texts_en)
             if not AZURE_OK:
                 st.error("Instala azure-cognitiveservices-speech para doblar.")
             else:
-                with st.spinner("Sintetizando y ajustando al tiempo del vídeo..."):
-                    wav = tts_azure(full_es, voice=voice, outfile="tts_es.wav", rate_pct=-4)
-                    fit = fit_audio_to_video(video, wav, "tts_fit.wav")
-                    out = mux_video_audio(video, fit, "video_doblado.mp4")
+                with st.spinner("Generando doblaje segmentado y sincronizado..."):
+                    wav_timeline = build_dubbed_audio_strict(
+                        video_path = video,
+                        segments_en = segments,
+                        translations_es = texts_es,
+                        voice = voice,
+                        out_wav = "tts_timeline.wav"
+                    )
+                    out = mux_video_audio(video, wav_timeline, "video_doblado.mp4")
                 st.success("✅ Doblaje listo")
                 st.video(out)
                 st.download_button("⬇️ Descargar video doblado", open(out,"rb"),
