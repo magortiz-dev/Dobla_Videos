@@ -85,7 +85,7 @@ def ensure_video_ok(video_path: str) -> str:
         pass
     remux = os.path.splitext(video_path)[0] + "_genpts.mp4"
     subprocess.run(
-        [_BIN or "", "-y", "-i", video_path,
+        [FFMPEG_BIN or "", "-y", "-i", video_path,
          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
          "-movflags", "+faststart", remux],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
@@ -216,7 +216,7 @@ def download_youtube(url: str) -> str:
         "geo_bypass": True,
         "http_headers": {"User-Agent": UA},
         "extractor_args": {"youtube": {"player_client": ["web","android","ios","tv"]}},
-        **({"_location": os.path.dirname(_BIN)} if _BIN else {}),
+        **({"_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
         "postprocessors": [{"key": "VideoConvertor", "preferedformat": "mp4"}],
         "postprocessor_args": {"VideoConvertor": ["-movflags", "faststart"]},
         "allow_multiple_video_streams": False,
@@ -260,7 +260,7 @@ def resolve_source(user_in: str, uploaded_path: str | None) -> str:
         if p.suffix.lower() in {".mp4",".webm",".mkv",".mov"}:
             return ensure_video_ok(str(p.resolve()))
         out = p.with_suffix(".mp4")
-        subprocess.run([_BIN or "","-y","-i",str(p),
+        subprocess.run([FFMPEG_BIN or "","-y","-i",str(p),
                         "-c:v","copy","-c:a","aac","-b:a","192k",
                         "-movflags","+faststart",str(out)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -280,7 +280,7 @@ def resolve_source(user_in: str, uploaded_path: str | None) -> str:
         if p.suffix.lower() in {".mp4",".webm",".mkv",".mov"}:
             return ensure_video_ok(str(p.resolve()))
         out = p.with_suffix(".mp4")
-        subprocess.run([_BIN or "","-y","-i",str(p),
+        subprocess.run([FFMPEG_BIN or "","-y","-i",str(p),
                         "-c:v","copy","-c:a","aac","-b:a","192k",
                         "-movflags","+faststart",str(out)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
