@@ -25,23 +25,34 @@ FFPROBE_BIN = None
 FFMPEG_BIN = None
 
 def _setup_ffmpeg():
-    global FFMPEG_BIN
-    sys_ffmpeg = shutil.which("ffmpeg")
+    global FFMPEG_BIN, FFPROBE_BIN
+    sys_ffmpeg  = shutil.which("ffmpeg")
+    sys_ffprobe = shutil.which("ffprobe")
+
     if sys_ffmpeg:
         FFMPEG_BIN = sys_ffmpeg
+        FFPROBE_BIN = sys_ffprobe
     else:
         import imageio_ffmpeg
         FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+        # intenta localizar un ffprobe “vecino”
+        guess_probe = os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe")
+        FFPROBE_BIN = guess_probe if os.path.exists(guess_probe) else sys_ffprobe
         os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH","")
-        os.environ["FFMPEG_BINARY"] = FFMPEG_BIN  # por si alguna lib lo respeta
-    # Registrar en PyDub
+        os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
+
+    # Registrar en pydub
     AudioSegment.converter = FFMPEG_BIN
+    if FFPROBE_BIN:
+        AudioSegment.ffprobe = FFPROBE_BIN
 
 def _ffmpeg_ok():
     return bool(FFMPEG_BIN) or (shutil.which("ffmpeg") is not None)
 
 _setup_ffmpeg()
 
+
+# --- Duración robusta: ffprobe -> parseo de ffmpeg -> pydub ---
 def _to_float(s: str) -> float:
     s = (s or "").strip().replace(",", ".")
     try:
@@ -49,39 +60,74 @@ def _to_float(s: str) -> float:
     except:
         return 0.0
 
-def _ffprobe_text(args):
-    if not FFPROBE_BIN:
-        return ""
-    try:
-        out = subprocess.check_output(args, stderr=subprocess.STDOUT)
-        return out.decode(errors="ignore")
-    except Exception:
-        return ""
+def _duration_from_ffmpeg_stderr(txt: str) -> float:
+    # Busca: Duration: 00:02:03.45
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", txt or "")
+    if not m: 
+        return 0.0
+    hh, mm, ss = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    return hh * 3600 + mm * 60 + ss
 
 def _probe_duration(path: str) -> float:
     try:
         if not os.path.exists(path) or os.path.getsize(path) == 0:
             return 0.0
+
+        # 1) ffprobe (si está)
+        if FFPROBE_BIN and os.path.exists(FFPROBE_BIN):
+            for args in (
+                [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=duration", "-of", "default=nokey=1:noprint_wrappers=1", path],
+                [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=nokey=1:noprint_wrappers=1", path],
+            ):
+                p = subprocess.run(args, capture_output=True, text=True)
+                val = _to_float(p.stdout)
+                if val > 0:
+                    return val
+
+        # 2) Parsear stderr de ffmpeg -i (siempre tenemos FFMPEG_BIN)
+        if FFMPEG_BIN:
+            p = subprocess.run([FFMPEG_BIN, "-hide_banner", "-i", path],
+                               capture_output=True, text=True)
+            val = _duration_from_ffmpeg_stderr(p.stderr or "")
+            if val > 0:
+                return val
+
+        # 3) pydub como último recurso
         seg = AudioSegment.from_file(path)
         return len(seg) / 1000.0
     except Exception:
         return 0.0
 
+# --- Remux y normalización a MP4 si la duración falla o el contenedor no es MP4 ---
 def ensure_video_ok(video_path: str) -> str:
-    try:
-        d = _probe_duration(video_path)
-        if d > 0.1 and video_path.lower().endswith(".mp4"):
-            return video_path
-    except Exception:
-        pass
+    dur = _probe_duration(video_path)
+    if dur > 0.1 and video_path.lower().endswith(".mp4"):
+        return video_path
+
     remux = os.path.splitext(video_path)[0] + "_genpts.mp4"
     subprocess.run(
-        [FFMPEG_BIN or "", "-y", "-i", video_path,
+        [FFMPEG_BIN, "-y", "-fflags", "+genpts", "-i", video_path,
          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
          "-movflags", "+faststart", remux],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
     )
-    return remux if os.path.exists(remux) and os.path.getsize(remux) > 0 else video_path
+
+    # Reintenta medir tras remux
+    if _probe_duration(remux) > 0.1:
+        return remux
+
+    # Último intento: recodificar (lento pero seguro)
+    rec = os.path.splitext(video_path)[0] + "_reencode.mp4"
+    subprocess.run(
+        [FFMPEG_BIN, "-y", "-i", video_path,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+         "-c:a", "aac", "-b:a", "192k",
+         "-movflags", "+faststart", rec],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+    )
+    return rec if _probe_duration(rec) > 0.1 else video_path
 
 # ---------- yt-dlp: cookies/proxy desde Secrets/ENV ----------
 YTDLP_COOKIEFILE = None
