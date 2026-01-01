@@ -513,16 +513,14 @@ def mux_video_audio(video: str, audio: str, out="video_doblado.mp4") -> str:
     return out
 
 # ---------- UI ----------
-st.set_page_config(page_title="Doblador EN→ES estable", page_icon="🎬", layout="centered")
-st.title("🎬 Doblador EN→ES ")
+st.set_page_config(page_title="Doblador EN→ES", page_icon="🎬", layout="centered")
+st.title("🎬 Doblador EN→ES (by Miguel Ángel Gómez Ortiz)")
 
 st.markdown("**Entrada de vídeo** (recomendado: subir archivo o usar enlace directo).")
 col_u, col_o = st.columns([2,1])
 with col_u:
     source = st.text_input("Pega una URL directa (Drive/Dropbox/OneDrive/MP4) o de YouTube (menos estable):")
 uploaded = st.file_uploader("…o sube un vídeo (mp4/webm/mkv/mov)", type=["mp4","webm","mkv","mov"])
-
-st.caption(f"ffmpeg: {'✅' if _ffmpeg_ok() else '❌'}  |  Cookies YouTube: {'✅' if YTDLP_COOKIEFILE else '—'}")
 
 accion = st.radio("Acción", ["Obtener el texto en inglés","Obtener la traducción a español","Hacer el doblaje del video"], index=2)
 
