@@ -50,6 +50,29 @@ def _ffmpeg_ok():
 
 _setup_ffmpeg()
 
+# --- Título con banderas ---
+def render_title_with_flags():
+    GB = "https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/svg/1f1ec-1f1e7.svg"  # 🇬🇧
+    ES = "https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/svg/1f1ea-1f1f8.svg"  # 🇪🇸
+    st.markdown(
+        f"""
+        <div style="display:flex; align-items:center; gap:14px; margin-top:6px; margin-bottom:10px;">
+          <span style="font-size:2rem; line-height:1;">🎬</span>
+          <span style="font-size:1.8rem; font-weight:700; letter-spacing:0.2px;">
+            Doblador Videos
+          </span>
+          <div style="display:flex; align-items:center; gap:10px; margin-left:8px;">
+            <img src="{GB}" style="height:1.6rem; vertical-align:middle;">
+            <span style="font-weight:700; font-size:1.25rem;">EN</span>
+            <span style="opacity:0.7; font-size:1.25rem;">→</span>
+            <img src="{ES}" style="height:1.6rem; vertical-align:middle;">
+            <span style="font-weight:700; font-size:1.25rem;">ES</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    
 # --- Duración robusta: ffprobe -> parseo de ffmpeg -> pydub ---
 def _to_float(s: str) -> float:
     s = (s or "").strip().replace(",", "."); 
@@ -553,7 +576,7 @@ def mux_video_audio(video: str, audio: str, out="video_doblado.mp4") -> str:
 
 # ---------- UI ----------
 st.set_page_config(page_title="Doblador EN→ES", page_icon="🎬", layout="centered")
-st.title("🎬 Doblador Vídeos EN→ES ")
+render_title_with_flags()
 st.caption("por Miguel Ángel Gómez Ortiz")
 
 st.markdown("**Entrada de vídeo** (recomendado: subir archivo o usar enlace directo).")
