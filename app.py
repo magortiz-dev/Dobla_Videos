@@ -59,7 +59,7 @@ def render_title_with_flags():
         <div style="display:flex; align-items:center; gap:14px; margin-top:6px; margin-bottom:10px;">
           <span style="font-size:2rem; line-height:1;">🎬</span>
           <span style="font-size:1.8rem; font-weight:700; letter-spacing:0.2px;">
-            Doblador Videos
+            Doblador de Videos
           </span>
           <div style="display:flex; align-items:center; gap:10px; margin-left:8px;">
             <img src="{GB}" style="height:1.6rem; vertical-align:middle;">
