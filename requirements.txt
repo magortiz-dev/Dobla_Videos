@@ -1,24 +1,25 @@
-# --- UI ---
-streamlit>=1.32,<1.53
+streamlit>=1.32
 
-# --- Descargas (estable) ---
-yt-dlp==2024.12.13
-gdown==5.2.0
-requests>=2.31,<3
-imageio-ffmpeg>=0.4.9   # ffmpeg/ffprobe portables (fallback)
+# Descarga/entrada de vídeo
+yt-dlp>=2024.12.13
+pytube>=15.0.0
+requests>=2.31.0
+gdown>=5.2.0
 
-# --- Audio/Video base ---
-pydub==0.25.1            # en Py 3.11 usa stdlib 'audioop' (OK)
+# Audio / ffmpeg wrapper
+pydub==0.25.1
+imageio-ffmpeg>=0.4.9
 
-# --- ASR (Whisper CPU) ---
-openai-whisper==20231117  # versión estable
-torch==2.3.1              # wheel CPU compatible en Linux
-numpy==1.26.4             # Whisper + SciPy en Py3.11
-scipy==1.11.4
+# Whisper (ASR)
+openai-whisper>=20231117
 
-# --- Traducción ---
-google-cloud-translate>=2,<4  # usa translate_v2
-deep-translator>=1.11,<2      # fallback local
+# NumPy/SciPy
+numpy<2.0,>=1.26
+scipy>=1.11
 
-# --- TTS (Azure) ---
-azure-cognitiveservices-speech==1.41.1
+# Traducción privada (Hugging Face NLLB)
+transformers>=4.44.0
+sentencepiece>=0.2.0
+
+# TTS Azure (es-ES)
+azure-cognitiveservices-speech>=1.38.0
