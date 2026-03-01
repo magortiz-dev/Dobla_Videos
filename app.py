@@ -330,7 +330,7 @@ def translate_hf(text: str) -> str:
     enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
     gen = model.generate(**enc, forced_bos_token_id=forced_bos_id, max_length=1024, num_beams=4)
     out = tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
-    
+    outs=[]
     pieces = _chunk_by_tokens(text, tokenizer, max_tokens=768)
     for chunk in pieces:
         if not chunk.strip():
