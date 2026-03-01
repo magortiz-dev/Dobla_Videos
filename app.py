@@ -23,6 +23,7 @@ import whisper
 # ---------- HF NLLB (Hugging Face) ----------
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
+
 # Preferir ffmpeg del sistema; fallback a imageio-ffmpeg
 FFPROBE_BIN = None
 FFMPEG_BIN = None
@@ -54,16 +55,20 @@ _setup_ffmpeg()
 
 # --- Título ---
 def render_title_with_flags():
+    GB = "https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/svg/1f1ec-1f1e7.svg"  # 🇬🇧
+    ES = "https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/svg/1f1ea-1f1f8.svg"  # 🇪🇸
     st.markdown(
-        """
+        f"""
         <div style="display:flex; align-items:center; gap:14px; margin-top:6px; margin-bottom:10px;">
           <span style="font-size:2rem; line-height:1;">🎬</span>
           <span style="font-size:1.8rem; font-weight:700; letter-spacing:0.2px;">
             Doblador de Vídeos
           </span>
           <div style="display:flex; align-items:center; gap:10px; margin-left:8px;">
+            <img src="{GB}" style="height:1.6rem; vertical-align:middle;">
             <span style="font-weight:700; font-size:1.25rem;">EN</span>
             <span style="opacity:0.7; font-size:1.25rem;">→</span>
+            <img src="{ES}" style="height:1.6rem; vertical-align:middle;">
             <span style="font-weight:700; font-size:1.25rem;">ES</span>
           </div>
         </div>
@@ -280,16 +285,27 @@ def transcribe_segments(audio_wav_path: str, model_size: str = "small"):
 def _load_hf_translator():
     model_id = "facebook/nllb-200-distilled-600M"
     hf_token = os.getenv("HF_TOKEN")
-    # Permite token desde st.secrets si existe
+
     if not hf_token:
         try:
             hf_token = st.secrets.get("HF_TOKEN", None)
         except Exception:
             hf_token = None
-    tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+
+    # ✅ clave: usar tokenizer "slow" para que soporte bien códigos NLLB
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False, token=hf_token)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_id, token=hf_token)
+
     tokenizer.src_lang = "eng_Latn"
-    forced_bos_id = tokenizer.lang_code_to_id["spa_Latn"]
+
+    # ✅ NO usar lang_code_to_id; usar conversión de token a id
+    forced_bos_id = tokenizer.convert_tokens_to_ids("spa_Latn")
+    if forced_bos_id is None or forced_bos_id == tokenizer.unk_token_id:
+        forced_bos_id = tokenizer.get_vocab().get("spa_Latn")
+
+    if forced_bos_id is None:
+        raise RuntimeError("No se pudo obtener forced_bos_token_id para spa_Latn (NLLB).")
+
     return model, tokenizer, forced_bos_id
 
 def _chunk_by_tokens(text: str, tokenizer, max_tokens: int = 768):
@@ -311,20 +327,16 @@ def _chunk_by_tokens(text: str, tokenizer, max_tokens: int = 768):
 
 def translate_hf(text: str) -> str:
     model, tokenizer, forced_bos_id = _load_hf_translator()
+    enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
+    gen = model.generate(**enc, forced_bos_token_id=forced_bos_id, max_length=1024, num_beams=4)
+    out = tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
+    
     pieces = _chunk_by_tokens(text, tokenizer, max_tokens=768)
-    outs = []
     for chunk in pieces:
         if not chunk.strip():
             outs.append("")
             continue
-        enc = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=1024)
-        gen = model.generate(
-            **enc,
-            forced_bos_token_id=forced_bos_id,
-            max_length=1024,
-            num_beams=4
-        )
-        outs.append(tokenizer.batch_decode(gen, skip_special_tokens=True)[0])
+                  
     return " ".join(outs).strip()
 
 def translate_list_hf(texts: list[str]) -> list[str]:
