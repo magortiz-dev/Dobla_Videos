@@ -84,6 +84,29 @@ def _duration_from_ffmpeg_stderr(txt: str) -> float:
     return hh*3600 + mm*60 + ss
 
 
+def _probe_duration(path: str) -> float:
+    """
+    Mide duración sin depender de ffprobe (no disponible en Streamlit Cloud).
+    1) Parseo de 'ffmpeg -i' (stderr) -> Duration
+    2) Fallback: pydub (usa ffmpeg como converter)
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return 0.0
+
+        p = subprocess.run([FFMPEG_BIN, "-hide_banner", "-i", path],
+                           capture_output=True, text=True)
+        dur = _duration_from_ffmpeg_stderr(p.stderr or "")
+        if dur > 0:
+            return float(dur)
+
+        seg = AudioSegment.from_file(path)
+        return len(seg) / 1000.0
+    except Exception:
+        return 0.0
+
+
+
 def ensure_video_ok(video_path: str) -> str:
     dur=_probe_duration(video_path)
     if dur>0.1 and video_path.lower().endswith(".mp4"): return video_path
@@ -184,9 +207,9 @@ def download_youtube(url: str) -> str:
         "geo_bypass": True,
         "http_headers": {"User-Agent": UA},
         "extractor_args": {"youtube": {"player_client": ["web","android","ios","tv"]}},
-        **({"_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
-        "postprocessors": [{"key": "VideoConvertor", "preferedformat": "mp4"}],
-        "postprocessor_args": {"VideoConvertor": ["-movflags", "faststart"]},
+        **({"ffmpeg_location": os.path.dirname(FFMPEG_BIN)} if FFMPEG_BIN else {}),
+        "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+        "postprocessor_args": {"FFmpegVideoRemuxer": ["-movflags", "faststart"], "FFmpegMerger": ["-movflags", "faststart"]},
         "allow_multiple_video_streams": False,
         "allow_multiple_audio_streams": False,
         "format_sort": ["proto:https","ext:mp4:m4a","vcodec:h264:avc1","acodec:aac:mp4a","res","tbr"],
@@ -301,19 +324,30 @@ def _chunk_by_tokens(text: str, tokenizer, max_tokens: int = 768):
     if curr: batches.append(" ".join(curr))
     return batches
 
+
 def translate_hf(text: str) -> str:
+    """Traduce EN→ES con NLLB por trozos (sin servicios externos)."""
     model, tokenizer, forced_bos_id = _load_hf_translator()
-    enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
-    gen = model.generate(**enc, forced_bos_token_id=forced_bos_id, max_length=1024, num_beams=4)
-    out = tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
-    outs=[]
+    text = (text or "").strip()
+    if not text:
+        return ""
+
     pieces = _chunk_by_tokens(text, tokenizer, max_tokens=768)
+    outs = []
     for chunk in pieces:
-        if not chunk.strip():
-            outs.append("")
+        chunk = (chunk or "").strip()
+        if not chunk:
             continue
-                  
+        enc = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=1024)
+        gen = model.generate(
+            **enc,
+            forced_bos_token_id=forced_bos_id,
+            max_length=1024,
+            num_beams=4
+        )
+        outs.append(tokenizer.batch_decode(gen, skip_special_tokens=True)[0])
     return " ".join(outs).strip()
+
 
 def translate_list_hf(texts: list[str]) -> list[str]:
     # Procesa uno a uno para no romper contexto y mantener naturalidad por segmento
