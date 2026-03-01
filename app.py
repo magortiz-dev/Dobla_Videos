@@ -25,28 +25,23 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 
 # Preferir ffmpeg del sistema; fallback a imageio-ffmpeg
-FFPROBE_BIN = None
 FFMPEG_BIN = None
 
 def _setup_ffmpeg():
-    global FFMPEG_BIN, FFPROBE_BIN
+    global FFMPEG_BIN
     sys_ffmpeg  = shutil.which("ffmpeg")
-    sys_ffprobe = shutil.which("ffprobe")
+    
 
     if sys_ffmpeg:
         FFMPEG_BIN = sys_ffmpeg
-        FFPROBE_BIN = sys_ffprobe
     else:
         import imageio_ffmpeg
         FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
-        guess_probe = os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe")
-        FFPROBE_BIN = guess_probe if os.path.exists(guess_probe) else sys_ffprobe
         os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH","")
         os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
 
+    # Registrar SOLO ffmpeg en pydub
     AudioSegment.converter = FFMPEG_BIN
-    if FFPROBE_BIN:
-        AudioSegment.ffprobe = FFPROBE_BIN
 
 def _ffmpeg_ok():
     return bool(FFMPEG_BIN) or (shutil.which("ffmpeg") is not None)
@@ -88,25 +83,6 @@ def _duration_from_ffmpeg_stderr(txt: str) -> float:
     hh, mm, ss = int(m.group(1)), int(m.group(2)), float(m.group(3))
     return hh*3600 + mm*60 + ss
 
-def _probe_duration(path: str) -> float:
-    try:
-        if not os.path.exists(path) or os.path.getsize(path) == 0: return 0.0
-        if FFPROBE_BIN and os.path.exists(FFPROBE_BIN):
-            for args in (
-                [FFPROBE_BIN,"-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nokey=1:noprint_wrappers=1",path],
-                [FFPROBE_BIN,"-v","error","-show_entries","format=duration","-of","default=nokey=1:noprint_wrappers=1",path],
-            ):
-                p=subprocess.run(args,capture_output=True,text=True)
-                val=_to_float(p.stdout)
-                if val>0: return val
-        if FFMPEG_BIN:
-            p=subprocess.run([FFMPEG_BIN,"-hide_banner","-i",path],capture_output=True,text=True)
-            val=_duration_from_ffmpeg_stderr(p.stderr or "")
-            if val>0: return val
-        seg=AudioSegment.from_file(path)
-        return len(seg)/1000.0
-    except Exception:
-        return 0.0
 
 def ensure_video_ok(video_path: str) -> str:
     dur=_probe_duration(video_path)
