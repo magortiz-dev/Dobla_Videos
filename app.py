@@ -631,7 +631,7 @@ def translate_en2es_with_rules(en_text: str) -> str:
     es = post_edit_es(es)
     return es
 
-def translate_list_en2es_with_rules(texts: List[str], batch_size: int = 8, progress: st.progress | None = None) -> List[str]:
+def translate_list_en2es_with_rules(texts: List[str], batch_size: int = 8, progress=None) -> List[str]:
     """Traduce lista (segmentos). Para no parecer bloqueado, actualiza progreso."""
     out = []
     n = len(texts)
@@ -784,7 +784,7 @@ def build_dubbed_audio_clusters(video_path: str,
                                 translations_es: List[str],
                                 voice: str,
                                 out_wav: str = "tts_timeline.wav",
-                                progress: st.progress | None = None) -> str:
+                                progress=None) -> str:
     if not segments_en:
         raise RuntimeError("No hay segmentos de Whisper.")
     if len(translations_es) != len(segments_en):
