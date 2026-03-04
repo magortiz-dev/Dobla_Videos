@@ -53,7 +53,20 @@ def _setup_ffmpeg():
         os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
     # Registrar SOLO ffmpeg en pydub
     AudioSegment.converter = FFMPEG_BIN
+import warnings
+from pydub.utils import which as pydub_which
 
+# Silencia el warning de pydub (ya tenemos FFMPEG_BIN)
+warnings.filterwarnings(
+    "ignore",
+    message="Couldn't find ffmpeg or avconv*",
+    category=RuntimeWarning,
+)
+
+# Asegura que pydub encuentra ffmpeg en reruns
+if FFMPEG_BIN:
+    os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
+    os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
 def _ffmpeg_ok() -> bool:
     return bool(FFMPEG_BIN) or (shutil.which("ffmpeg") is not None)
 
