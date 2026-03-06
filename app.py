@@ -32,7 +32,7 @@ import yt_dlp
 import whisper
 
 # ---------- Hugging Face (M2M100, MIT) ----------
-from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
+from transformers import MarianMTModel, MarianTokenizer
 
 
 # =============================================================================
@@ -53,20 +53,7 @@ def _setup_ffmpeg():
         os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
     # Registrar SOLO ffmpeg en pydub
     AudioSegment.converter = FFMPEG_BIN
-import warnings
-from pydub.utils import which as pydub_which
 
-# Silencia el warning de pydub (ya tenemos FFMPEG_BIN)
-warnings.filterwarnings(
-    "ignore",
-    message="Couldn't find ffmpeg or avconv*",
-    category=RuntimeWarning,
-)
-
-# Asegura que pydub encuentra ffmpeg en reruns
-if FFMPEG_BIN:
-    os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
-    os.environ["PATH"] = os.path.dirname(FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
 def _ffmpeg_ok() -> bool:
     return bool(FFMPEG_BIN) or (shutil.which("ffmpeg") is not None)
 
@@ -524,12 +511,18 @@ def to_spoken_spanish_from_raw_address(raw: str) -> str:
 def unprotect_addresses_as_spoken(text: str, mapping: dict, mapping_types: dict) -> str:
     if not mapping:
         return text
+    TECH_ES_MAP = {
+        "AI": "IA",
+        "GENAI": "IA generativa",
+    }
     for token, original in sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True):
         typ = mapping_types.get(token, "")
-        if typ in {"url", "email", "domain_path", "domain"}:
+        if typ in {"url","email","domain_path","domain"}:
             text = text.replace(token, to_spoken_spanish_from_raw_address(original))
+        elif typ == "tech":
+            text = text.replace(token, TECH_ES_MAP.get(original.upper(), original))
         else:
-            text = text.replace(token, original)  # tech exacto
+            text = text.replace(token, original)
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 def fix_spanish_intro(es_text: str) -> str:
@@ -565,87 +558,107 @@ def post_edit_es(s: str) -> str:
     return s
 
 
+
 # =============================================================================
-# Traducción local (M2M100) + reglas protect/unprotect
+# Traducción local (OPUS-MT / Marian) + reglas protect/unprotect
 # =============================================================================
+# Modelo recomendado (licencia permisiva, uso comercial): Helsinki-NLP/opus-mt-en-es (Apache-2.0)
+# Alternativa con más calidad (requiere atribución): Helsinki-NLP/opus-mt-tc-big-en-es (CC-BY-4.0)
+#
+# Puedes cambiar el modelo sin tocar código:
+#   export HF_MT_MODEL="Helsinki-NLP/opus-mt-en-es"
+# o en Streamlit Cloud -> Secrets:
+#   HF_MT_MODEL="Helsinki-NLP/opus-mt-en-es"
+
+HF_MT_MODEL = os.getenv("HF_MT_MODEL", "Helsinki-NLP/opus-mt-tc-big-en-es")
+
 @st.cache_resource(show_spinner=False)
-def _load_m2m100():
-    model_id = "facebook/m2m100_418M"  # MIT
-    tok = M2M100Tokenizer.from_pretrained(model_id)
-    model = M2M100ForConditionalGeneration.from_pretrained(model_id)
+def _load_opus_mt():
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        try:
+            hf_token = st.secrets.get("HF_TOKEN", None)
+        except Exception:
+            hf_token = None
+
+    tok = MarianTokenizer.from_pretrained(HF_MT_MODEL, token=hf_token)
+    model = MarianMTModel.from_pretrained(HF_MT_MODEL, token=hf_token)
     return tok, model
 
-def _split_sentences_for_mt(text: str, max_chars: int = 900) -> List[str]:
+def _split_for_marian(text: str, max_chars: int = 900) -> List[str]:
+    """Divide texto en trozos “amables” para MarianMT (max_length ~512)."""
     text = (text or "").strip()
     if not text:
         return []
-    parts = []
+    parts = re.split(r'(?<=[\.\!\?\;\:\n])\s+', text)
+    out = []
     buf = []
     size = 0
-    # split suave por signos finales
-    for chunk in re.split(r'([.!?…])\s+', text):
-        if chunk is None:
-            continue
-        if size + len(chunk) > max_chars and buf:
-            parts.append("".join(buf).strip())
-            buf, size = [], 0
-        buf.append(chunk)
-        size += len(chunk)
-    if buf:
-        parts.append("".join(buf).strip())
-    # fallback por palabras si alguno es muy largo
-    out = []
     for p in parts:
-        if len(p) <= max_chars:
-            out.append(p)
+        p = p.strip()
+        if not p:
+            continue
+        if size + len(p) > max_chars and buf:
+            out.append(" ".join(buf).strip())
+            buf, size = [], 0
+        buf.append(p)
+        size += len(p) + 1
+    if buf:
+        out.append(" ".join(buf).strip())
+
+    final = []
+    for chunk in out:
+        if len(chunk) <= max_chars:
+            final.append(chunk)
         else:
-            words = p.split()
-            curr = []
+            words = chunk.split()
+            cur = []
             sz = 0
             for w in words:
-                wlen = len(w) + 1
-                if sz + wlen > max_chars and curr:
-                    out.append(" ".join(curr))
-                    curr, sz = [w], len(w)
+                if sz + len(w) + 1 > max_chars and cur:
+                    final.append(" ".join(cur))
+                    cur, sz = [w], len(w)
                 else:
-                    curr.append(w); sz += wlen
-            if curr:
-                out.append(" ".join(curr))
-    return [x for x in out if x.strip()]
+                    cur.append(w); sz += len(w) + 1
+            if cur:
+                final.append(" ".join(cur))
+    return final
 
-def _m2m_translate_text(en_text: str) -> str:
-    tok, model = _load_m2m100()
-    tok.src_lang = "en"
-    pieces = _split_sentences_for_mt(en_text, max_chars=900)
+def _opus_translate_text(en_text: str) -> str:
+    tok, model = _load_opus_mt()
+    chunks = _split_for_marian(en_text, max_chars=900)
     outs = []
-    for ch in pieces:
-        inputs = tok(ch, return_tensors="pt", truncation=True, max_length=1024)
-        gen = model.generate(
-            **inputs,
-            forced_bos_token_id=tok.get_lang_id("es"),
-            max_length=1024,
-            num_beams=4,
-            length_penalty=1.05
-        )
+    for ch in chunks:
+        batch = tok([ch], return_tensors="pt", truncation=True, max_length=512)
+        gen = model.generate(**batch, num_beams=4, max_length=512)
         outs.append(tok.batch_decode(gen, skip_special_tokens=True)[0])
     return " ".join(outs).strip()
 
+def fix_ai_terms_es(s: str) -> str:
+    """Normaliza: 'generative AI' -> 'IA generativa' y 'AI' -> 'IA'."""
+    if not s:
+        return s
+    s = re.sub(r"(?i)\bAI\s+generativ[oa]\b", "IA generativa", s)
+    s = re.sub(r"(?i)\bgenerativ[oa]\s+AI\b", "IA generativa", s)
+    s = re.sub(r"(?i)\bIA\s+generativ[oa]\b", "IA generativa", s)
+    s = re.sub(r"(?i)\bgen[-\s]*AI\b", "IA generativa", s)
+    s = re.sub(r"(?<![A-Za-z])AI(?![A-Za-z])", "IA", s)
+    return s
+
 def translate_en2es_with_rules(en_text: str) -> str:
-    # 1) Canonicaliza acrónimos tech
     norm = canonicalize_tech_acronyms(en_text or "")
-    # 2) Protege direcciones y tech
     tech_re = compile_tech_regex(set(BASE_TECH_TERMS), protect_all_caps=True)
     prot, mapping, mapping_types = protect_spans_with_types(norm, tech_re=tech_re)
-    # 3) Traduce local (M2M100)
-    es = _m2m_translate_text(prot)
-    # 4) Desprotege: URLs/emails -> hablado, tech -> exacto
+
+    es = _opus_translate_text(prot)
+
     es = unprotect_addresses_as_spoken(es, mapping, mapping_types)
-    # 5) Post edición ligera
     es = post_edit_es(es)
+    es = fix_ai_terms_es(es)
+    es = clean_spaces(es)
     return es
 
-def translate_list_en2es_with_rules(texts: List[str], batch_size: int = 8, progress=None) -> List[str]:
-    """Traduce lista (segmentos). Para no parecer bloqueado, actualiza progreso."""
+def translate_list_en2es_with_rules(texts: List[str], progress=None) -> List[str]:
     out = []
     n = len(texts)
     for i, t in enumerate(texts):
@@ -654,6 +667,8 @@ def translate_list_en2es_with_rules(texts: List[str], batch_size: int = 8, progr
             progress.progress((i + 1) / n)
     return out
 
+
+STRONG_END_EN_RE = re.compile(r"[.!?…]\s*$")
 
 # =============================================================================
 # TTS Azure: sincro por clústeres con ajuste de rate SSML
@@ -671,8 +686,8 @@ def get_azure_creds() -> Tuple[str | None, str | None]:
 
 # parámetros de sincro
 SYNC_OFFSET_MS       = 120
-JOIN_GAP_MS          = 475
-CLUSTER_MAX_MS       = 11000
+JOIN_GAP_MS          = 650
+CLUSTER_MAX_MS       = 14000
 GUARD_MS             = 30
 TAIL_MARGIN_MS       = 60
 MIN_WINDOW_MS        = 300
@@ -689,6 +704,8 @@ def _calc_gap_ms(seg_prev, seg_next) -> int:
     return int((float(seg_next["start"]) - float(seg_prev["end"])) * 1000)
 
 def _cluster_segments(segments_en: List[dict], texts_es: List[str]) -> List[dict]:
+    # Une segmentos usando la puntuación fuerte del ORIGINAL en inglés (Whisper),
+    # no del español (evita cortes por puntos añadidos al traducir).
     clusters = []
     i = 0
     n = len(segments_en)
@@ -698,12 +715,15 @@ def _cluster_segments(segments_en: List[dict], texts_es: List[str]) -> List[dict
         parts = [texts_es[i].strip()]
         j = i
         while j + 1 < n:
+            en_txt = (segments_en[j].get("text") or "").strip()
+            if STRONG_END_EN_RE.search(en_txt):
+                break
             gap = _calc_gap_ms(segments_en[j], segments_en[j+1])
             end_ms_next = int(float(segments_en[j+1]["end"]) * 1000)
-            dur_if_join = (end_ms_next - start_ms)
-            if _ends_with_strong_punct(parts[-1]): break
-            if gap > JOIN_GAP_MS: break
-            if dur_if_join > CLUSTER_MAX_MS: break
+            if gap > JOIN_GAP_MS:
+                break
+            if (end_ms_next - start_ms) > CLUSTER_MAX_MS:
+                break
             j += 1
             end_ms = end_ms_next
             parts.append(texts_es[j].strip())
@@ -735,7 +755,7 @@ def _azure_tts_bytes(text: str, voice: str, rate_pct: int) -> bytes:
     return bytes(res.audio_data)
 
 def _tts_cluster_fit(text: str, voice: str, window_ms: int) -> AudioSegment:
-    """Ajusta rate SSML para encajar en ventana; atempo suave como último recurso."""
+    # Ajusta rate SSML para encajar; evita silencios largos no naturales.
     attempt_rates = [-4, None, None]
     audio_seg = None
     last_bytes = None
@@ -765,17 +785,21 @@ def _tts_cluster_fit(text: str, voice: str, window_ms: int) -> AudioSegment:
         audio_seg = AudioSegment.from_file(io.BytesIO(data), format="wav")
         dur_ms = len(audio_seg)
 
-        if abs(dur_ms - window_ms) <= 200:
-            if dur_ms < window_ms:
-                audio_seg = audio_seg + AudioSegment.silent(duration=(window_ms - dur_ms))
-            elif dur_ms > window_ms:
+        diff = window_ms - dur_ms
+        if abs(diff) <= 150:
+            if diff > 0:
+                audio_seg = audio_seg + AudioSegment.silent(duration=diff)
+            else:
                 audio_seg = audio_seg[:window_ms]
             return audio_seg
 
-    # atempo suave si sigue largo
-    if len(audio_seg) > window_ms:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf_in, \
-             tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf_out:
+        # Si ya cabe, NO rellenamos todo el hueco: evitamos pausas artificiales
+        if dur_ms < window_ms:
+            return audio_seg + AudioSegment.silent(duration=40)
+
+    # Último recurso: atempo suave si sigue largo
+    if audio_seg is not None and len(audio_seg) > window_ms:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf_in,              tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf_out:
             AudioSegment.from_file(io.BytesIO(last_bytes), format="wav").export(tf_in.name, format="wav")
             factor = min(ATEMPO_LAST_RESORT, len(audio_seg) / float(window_ms))
             subprocess.run([FFMPEG_BIN, "-y", "-i", tf_in.name, "-filter:a", f"atempo={factor:.3f}", tf_out.name],
@@ -789,8 +813,9 @@ def _tts_cluster_fit(text: str, voice: str, window_ms: int) -> AudioSegment:
                 pass
         return audio_seg
 
-    # si quedó corto, silenciamos
-    return audio_seg + AudioSegment.silent(duration=(window_ms - len(audio_seg)))
+    if audio_seg is None:
+        return AudioSegment.silent(duration=min(200, window_ms))
+    return audio_seg
 
 def build_dubbed_audio_clusters(video_path: str,
                                 segments_en: List[dict],
