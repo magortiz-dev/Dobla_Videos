@@ -2,7 +2,6 @@ streamlit>=1.32
 
 # Descarga/entrada de vídeo
 yt-dlp>=2024.12.13
-pytube>=15.0.0
 requests>=2.31.0
 gdown>=5.2.0
 
@@ -12,12 +11,13 @@ imageio-ffmpeg>=0.4.9
 
 # Whisper (ASR)
 openai-whisper>=20231117
+torch>=2.3.0
 
 # NumPy/SciPy
 numpy<2.0,>=1.26
 scipy>=1.11
 
-# Traducción privada (Hugging Face NLLB)
+# Traducción privada (Hugging Face: OPUS-MT / Marian)
 transformers>=4.44.0
 sentencepiece>=0.2.0
 
