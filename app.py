@@ -32,7 +32,6 @@ import yt_dlp
 import whisper
 
 # ---------- Hugging Face (M2M100, MIT) ----------
-from transformers import MarianMTModel, MarianTokenizer
 
 
 # =============================================================================
@@ -508,21 +507,27 @@ def to_spoken_spanish_from_raw_address(raw: str) -> str:
         return pronounce_host_es(raw)
     return raw
 
+_PH_VARIANTS_RE = re.compile(r'(?i)(?:__\s*XTOK\s*[_-]?\s*(\d+)\s*__|\bXTOK\s*[_-]?\s*(\d+)\b)')
+
+def _normalize_placeholders(text: str) -> str:
+    """Normaliza variantes tipo 'XTOK0' o '__ XTOK _ 0 __' -> '__XTOK_0__'."""
+    if not text:
+        return text
+    def repl(m):
+        num = m.group(1) or m.group(2)
+        return f"{PLACE_PREF}{num}{PLACE_SUFF}"
+    return _PH_VARIANTS_RE.sub(repl, text)
+
 def unprotect_addresses_as_spoken(text: str, mapping: dict, mapping_types: dict) -> str:
     if not mapping:
         return text
-    TECH_ES_MAP = {
-        "AI": "IA",
-        "GENAI": "IA generativa",
-    }
+    text = _normalize_placeholders(text)
     for token, original in sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True):
         typ = mapping_types.get(token, "")
-        if typ in {"url","email","domain_path","domain"}:
+        if typ in {"url", "email", "domain_path", "domain"}:
             text = text.replace(token, to_spoken_spanish_from_raw_address(original))
-        elif typ == "tech":
-            text = text.replace(token, TECH_ES_MAP.get(original.upper(), original))
         else:
-            text = text.replace(token, original)
+            text = text.replace(token, original)  # tech exacto
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 def fix_spanish_intro(es_text: str) -> str:
@@ -551,29 +556,41 @@ def clean_spaces(s: str) -> str:
     s = re.sub(r'\s{2,}', ' ', s)
     return s.strip()
 
+def glossary_fix_es(s: str) -> str:
+    """Normalizaciones para español natural."""
+    if not s:
+        return s
+    # Generative AI / AI generativa -> IA generativa
+    s = re.sub(r'(?i)\bgenerative\s+(?:ai|ia)\b', 'IA generativa', s)
+    s = re.sub(r'(?i)\bgenerativ[ao]\s+(?:ai|ia)\b', 'IA generativa', s)
+    s = re.sub(r'(?i)\b(?:ai|ia)\s+generativ[ao]\b', 'IA generativa', s)
+    # AI aislado -> IA (no afecta OpenAI)
+    s = re.sub(r'(?<![A-Za-z])AI(?![A-Za-z])', 'IA', s)
+    # Capitalización final
+    s = re.sub(r'\bIA\s+Generativa\b', 'IA generativa', s)
+    return s
+
 def post_edit_es(s: str) -> str:
+    if not s:
+        return s
     s = clean_spaces(s)
     s = fix_spanish_intro(s)
+    s = glossary_fix_es(s)
     s = clean_spaces(s)
     return s
 
 
-
 # =============================================================================
-# Traducción local (OPUS-MT / Marian) + reglas protect/unprotect
+# Traducción local (Hugging Face OPUS-MT / Marian) + reglas protect/unprotect
 # =============================================================================
-# Modelo recomendado (licencia permisiva, uso comercial): Helsinki-NLP/opus-mt-en-es (Apache-2.0)
-# Alternativa con más calidad (requiere atribución): Helsinki-NLP/opus-mt-tc-big-en-es (CC-BY-4.0)
-#
-# Puedes cambiar el modelo sin tocar código:
-#   export HF_MT_MODEL="Helsinki-NLP/opus-mt-en-es"
-# o en Streamlit Cloud -> Secrets:
-#   HF_MT_MODEL="Helsinki-NLP/opus-mt-en-es"
-
-HF_MT_MODEL = os.getenv("HF_MT_MODEL", "Helsinki-NLP/opus-mt-tc-big-en-es")
+# Por defecto: Helsinki-NLP/opus-mt-tc-big-en-es (CC-BY 4.0).
+# Si prefieres otro modelo EN->ES:
+#   - define HF_MT_MODEL en Secrets/ENV.
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 
 @st.cache_resource(show_spinner=False)
-def _load_opus_mt():
+def _load_opus_translator():
+    model_id = os.getenv("HF_MT_MODEL", "Helsinki-NLP/opus-mt-tc-big-en-es")
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
         try:
@@ -581,69 +598,59 @@ def _load_opus_mt():
         except Exception:
             hf_token = None
 
-    tok = MarianTokenizer.from_pretrained(HF_MT_MODEL, token=hf_token)
-    model = MarianMTModel.from_pretrained(HF_MT_MODEL, token=hf_token)
-    return tok, model
+    tok = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+    mdl = AutoModelForSeq2SeqLM.from_pretrained(model_id, token=hf_token)
+    return pipeline("translation", model=mdl, tokenizer=tok, device=-1)
 
-def _split_for_marian(text: str, max_chars: int = 900) -> List[str]:
-    """Divide texto en trozos “amables” para MarianMT (max_length ~512)."""
+def _split_for_mt(text: str, max_chars: int = 900) -> List[str]:
     text = (text or "").strip()
     if not text:
         return []
-    parts = re.split(r'(?<=[\.\!\?\;\:\n])\s+', text)
+    parts = re.split(r'(?<=[\.!\?…;:])\s+', text)
     out = []
-    buf = []
-    size = 0
+    buf = ""
     for p in parts:
         p = p.strip()
         if not p:
             continue
-        if size + len(p) > max_chars and buf:
-            out.append(" ".join(buf).strip())
-            buf, size = [], 0
-        buf.append(p)
-        size += len(p) + 1
+        if len(buf) + len(p) + 1 <= max_chars:
+            buf = (buf + " " + p).strip()
+        else:
+            if buf:
+                out.append(buf)
+            buf = p
     if buf:
-        out.append(" ".join(buf).strip())
+        out.append(buf)
 
     final = []
-    for chunk in out:
-        if len(chunk) <= max_chars:
-            final.append(chunk)
+    for p in out:
+        if len(p) <= max_chars:
+            final.append(p)
         else:
-            words = chunk.split()
+            words = p.split()
             cur = []
             sz = 0
             for w in words:
-                if sz + len(w) + 1 > max_chars and cur:
+                lw = len(w) + 1
+                if sz + lw > max_chars and cur:
                     final.append(" ".join(cur))
                     cur, sz = [w], len(w)
                 else:
-                    cur.append(w); sz += len(w) + 1
+                    cur.append(w); sz += lw
             if cur:
                 final.append(" ".join(cur))
     return final
 
 def _opus_translate_text(en_text: str) -> str:
-    tok, model = _load_opus_mt()
-    chunks = _split_for_marian(en_text, max_chars=900)
+    tr = _load_opus_translator()
+    pieces = _split_for_mt(en_text, max_chars=900)
     outs = []
-    for ch in chunks:
-        batch = tok([ch], return_tensors="pt", truncation=True, max_length=512)
-        gen = model.generate(**batch, num_beams=4, max_length=512)
-        outs.append(tok.batch_decode(gen, skip_special_tokens=True)[0])
+    for ch in pieces:
+        if not ch.strip():
+            continue
+        res = tr(ch, max_length=512)
+        outs.append(res[0]["translation_text"])
     return " ".join(outs).strip()
-
-def fix_ai_terms_es(s: str) -> str:
-    """Normaliza: 'generative AI' -> 'IA generativa' y 'AI' -> 'IA'."""
-    if not s:
-        return s
-    s = re.sub(r"(?i)\bAI\s+generativ[oa]\b", "IA generativa", s)
-    s = re.sub(r"(?i)\bgenerativ[oa]\s+AI\b", "IA generativa", s)
-    s = re.sub(r"(?i)\bIA\s+generativ[oa]\b", "IA generativa", s)
-    s = re.sub(r"(?i)\bgen[-\s]*AI\b", "IA generativa", s)
-    s = re.sub(r"(?<![A-Za-z])AI(?![A-Za-z])", "IA", s)
-    return s
 
 def translate_en2es_with_rules(en_text: str) -> str:
     norm = canonicalize_tech_acronyms(en_text or "")
@@ -654,11 +661,9 @@ def translate_en2es_with_rules(en_text: str) -> str:
 
     es = unprotect_addresses_as_spoken(es, mapping, mapping_types)
     es = post_edit_es(es)
-    es = fix_ai_terms_es(es)
-    es = clean_spaces(es)
     return es
 
-def translate_list_en2es_with_rules(texts: List[str], progress=None) -> List[str]:
+def translate_list_en2es_with_rules(texts: List[str], batch_size: int = 8, progress=None) -> List[str]:
     out = []
     n = len(texts)
     for i, t in enumerate(texts):
@@ -666,9 +671,6 @@ def translate_list_en2es_with_rules(texts: List[str], progress=None) -> List[str
         if progress is not None and n > 0:
             progress.progress((i + 1) / n)
     return out
-
-
-STRONG_END_EN_RE = re.compile(r"[.!?…]\s*$")
 
 # =============================================================================
 # TTS Azure: sincro por clústeres con ajuste de rate SSML
@@ -686,8 +688,8 @@ def get_azure_creds() -> Tuple[str | None, str | None]:
 
 # parámetros de sincro
 SYNC_OFFSET_MS       = 120
-JOIN_GAP_MS          = 650
-CLUSTER_MAX_MS       = 14000
+JOIN_GAP_MS          = 475
+CLUSTER_MAX_MS       = 11000
 GUARD_MS             = 30
 TAIL_MARGIN_MS       = 60
 MIN_WINDOW_MS        = 300
@@ -704,8 +706,7 @@ def _calc_gap_ms(seg_prev, seg_next) -> int:
     return int((float(seg_next["start"]) - float(seg_prev["end"])) * 1000)
 
 def _cluster_segments(segments_en: List[dict], texts_es: List[str]) -> List[dict]:
-    # Une segmentos usando la puntuación fuerte del ORIGINAL en inglés (Whisper),
-    # no del español (evita cortes por puntos añadidos al traducir).
+    """Une segmentos usando puntuación del INGLÉS (Whisper) para evitar cortes raros del traductor."""
     clusters = []
     i = 0
     n = len(segments_en)
@@ -715,19 +716,23 @@ def _cluster_segments(segments_en: List[dict], texts_es: List[str]) -> List[dict
         parts = [texts_es[i].strip()]
         j = i
         while j + 1 < n:
-            en_txt = (segments_en[j].get("text") or "").strip()
-            if STRONG_END_EN_RE.search(en_txt):
+            gap = _calc_gap_ms(segments_en[j], segments_en[j + 1])
+            end_ms_next = int(float(segments_en[j + 1]["end"]) * 1000)
+            dur_if_join = (end_ms_next - start_ms)
+
+            en_tail = (segments_en[j].get("text") or "").strip()
+            if _ends_with_strong_punct(en_tail):
                 break
-            gap = _calc_gap_ms(segments_en[j], segments_en[j+1])
-            end_ms_next = int(float(segments_en[j+1]["end"]) * 1000)
             if gap > JOIN_GAP_MS:
                 break
-            if (end_ms_next - start_ms) > CLUSTER_MAX_MS:
+            if dur_if_join > CLUSTER_MAX_MS:
                 break
+
             j += 1
             end_ms = end_ms_next
             parts.append(texts_es[j].strip())
-        clusters.append({"start_ms": start_ms, "end_ms": end_ms, "text": " ".join(p for p in parts if p)})
+
+        clusters.append({"start_ms": start_ms, "end_ms": end_ms, "text": " ".join(x for x in parts if x)})
         i = j + 1
     return clusters
 
@@ -755,7 +760,7 @@ def _azure_tts_bytes(text: str, voice: str, rate_pct: int) -> bytes:
     return bytes(res.audio_data)
 
 def _tts_cluster_fit(text: str, voice: str, window_ms: int) -> AudioSegment:
-    # Ajusta rate SSML para encajar; evita silencios largos no naturales.
+    """Ajusta rate SSML para encajar en ventana; atempo suave como último recurso."""
     attempt_rates = [-4, None, None]
     audio_seg = None
     last_bytes = None
@@ -785,21 +790,17 @@ def _tts_cluster_fit(text: str, voice: str, window_ms: int) -> AudioSegment:
         audio_seg = AudioSegment.from_file(io.BytesIO(data), format="wav")
         dur_ms = len(audio_seg)
 
-        diff = window_ms - dur_ms
-        if abs(diff) <= 150:
-            if diff > 0:
-                audio_seg = audio_seg + AudioSegment.silent(duration=diff)
-            else:
+        if abs(dur_ms - window_ms) <= 200:
+            if dur_ms < window_ms:
+                audio_seg = audio_seg + AudioSegment.silent(duration=(window_ms - dur_ms))
+            elif dur_ms > window_ms:
                 audio_seg = audio_seg[:window_ms]
             return audio_seg
 
-        # Si ya cabe, NO rellenamos todo el hueco: evitamos pausas artificiales
-        if dur_ms < window_ms:
-            return audio_seg + AudioSegment.silent(duration=40)
-
-    # Último recurso: atempo suave si sigue largo
-    if audio_seg is not None and len(audio_seg) > window_ms:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf_in,              tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf_out:
+    # atempo suave si sigue largo
+    if len(audio_seg) > window_ms:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf_in, \
+             tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf_out:
             AudioSegment.from_file(io.BytesIO(last_bytes), format="wav").export(tf_in.name, format="wav")
             factor = min(ATEMPO_LAST_RESORT, len(audio_seg) / float(window_ms))
             subprocess.run([FFMPEG_BIN, "-y", "-i", tf_in.name, "-filter:a", f"atempo={factor:.3f}", tf_out.name],
@@ -813,9 +814,15 @@ def _tts_cluster_fit(text: str, voice: str, window_ms: int) -> AudioSegment:
                 pass
         return audio_seg
 
-    if audio_seg is None:
-        return AudioSegment.silent(duration=min(200, window_ms))
+# si quedó corto:
+# - si falta muy poco (<=250 ms), rellenamos para evitar chasquidos
+# - si falta mucho, NO añadimos silencio largo (suena a “parón” artificial)
+missing = window_ms - len(audio_seg)
+if missing <= 0:
     return audio_seg
+if missing <= 250:
+    return audio_seg + AudioSegment.silent(duration=missing)
+return audio_seg
 
 def build_dubbed_audio_clusters(video_path: str,
                                 segments_en: List[dict],
