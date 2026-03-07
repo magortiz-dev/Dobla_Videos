@@ -1,5 +1,7 @@
 streamlit>=1.32
 
+torch>=2.3.0
+
 # Descarga/entrada de vídeo
 yt-dlp>=2024.12.13
 requests>=2.31.0
@@ -23,3 +25,4 @@ sentencepiece>=0.2.0
 
 # TTS Azure (es-ES)
 azure-cognitiveservices-speech>=1.38.0
+
