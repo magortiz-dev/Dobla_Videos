@@ -814,15 +814,15 @@ def _tts_cluster_fit(text: str, voice: str, window_ms: int) -> AudioSegment:
                 pass
         return audio_seg
 
-# si quedó corto:
-# - si falta muy poco (<=250 ms), rellenamos para evitar chasquidos
-# - si falta mucho, NO añadimos silencio largo (suena a “parón” artificial)
-missing = window_ms - len(audio_seg)
-if missing <= 0:
+    # si quedó corto:
+    # - si falta muy poco (<=250 ms), rellenamos para evitar chasquidos
+    # - si falta mucho, NO añadimos silencio largo (suena a “parón” artificial)
+    missing = window_ms - len(audio_seg)
+    if missing <= 0:
+        return audio_seg
+    if missing <= 250:
+        return audio_seg + AudioSegment.silent(duration=missing)
     return audio_seg
-if missing <= 250:
-    return audio_seg + AudioSegment.silent(duration=missing)
-return audio_seg
 
 def build_dubbed_audio_clusters(video_path: str,
                                 segments_en: List[dict],
