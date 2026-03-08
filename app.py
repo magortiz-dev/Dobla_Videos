@@ -586,10 +586,12 @@ def post_edit_es(s: str) -> str:
 # Por defecto: Helsinki-NLP/opus-mt-tc-big-en-es (CC-BY 4.0).
 # Si prefieres otro modelo EN->ES:
 #   - define HF_MT_MODEL en Secrets/ENV.
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 @st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_opus_translator():
+    """Carga Marian/OPUS EN→ES. No usa pipeline('translation') para compatibilidad."""
     model_id = os.getenv("HF_MT_MODEL", "Helsinki-NLP/opus-mt-tc-big-en-es")
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
@@ -598,9 +600,9 @@ def _load_opus_translator():
         except Exception:
             hf_token = None
 
-    tok = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+    tok = AutoTokenizer.from_pretrained(model_id, use_fast=False, token=hf_token)
     mdl = AutoModelForSeq2SeqLM.from_pretrained(model_id, token=hf_token)
-    return pipeline("translation", model=mdl, tokenizer=tok, device=-1)
+    return tok, mdl
 
 def _split_for_mt(text: str, max_chars: int = 900) -> List[str]:
     text = (text or "").strip()
@@ -642,14 +644,15 @@ def _split_for_mt(text: str, max_chars: int = 900) -> List[str]:
     return final
 
 def _opus_translate_text(en_text: str) -> str:
-    tr = _load_opus_translator()
+    tok, mdl = _load_opus_translator()
     pieces = _split_for_mt(en_text, max_chars=900)
     outs = []
     for ch in pieces:
         if not ch.strip():
             continue
-        res = tr(ch, max_length=512)
-        outs.append(res[0]["translation_text"])
+        enc = tok(ch, return_tensors="pt", truncation=True, max_length=512)
+        gen = mdl.generate(**enc, max_length=512, num_beams=4)
+        outs.append(tok.batch_decode(gen, skip_special_tokens=True)[0])
     return " ".join(outs).strip()
 
 def translate_en2es_with_rules(en_text: str) -> str:
