@@ -1,28 +1,19 @@
 streamlit>=1.32
 
-torch>=2.3.0
-
-# Descarga/entrada de vídeo
+# Descarga de vídeo
 yt-dlp>=2024.12.13
-requests>=2.31.0
-gdown>=5.2.0
 
-# Audio / ffmpeg wrapper
-pydub==0.25.1
-imageio-ffmpeg>=0.4.9
-
-# Whisper (ASR)
+# ASR (Whisper)
 openai-whisper>=20231117
 torch>=2.3.0
-
-# NumPy/SciPy
 numpy<2.0,>=1.26
-scipy>=1.11
 
-# Traducción privada (Hugging Face: OPUS-MT / Marian)
-transformers>=4.44.0
-sentencepiece>=0.2.0
+# HTTP (Azure Translator)
+requests>=2.31.0
 
-# TTS Azure (es-ES)
+# Azure TTS
 azure-cognitiveservices-speech>=1.38.0
 
+# ffmpeg portable (Cloud)
+imageio-ffmpeg>=0.4.9
+pydub==0.25.1
