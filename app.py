@@ -16,7 +16,7 @@ from pathlib import Path
 import requests
 import streamlit as st
 import numpy as np
-from scipy.io import wavfile
+import wave
 
 import whisper
 import yt_dlp
@@ -27,6 +27,29 @@ try:
 except Exception:
     AZURE_SPEECH_OK = False
 
+
+def read_wav_mono16k(path: str) -> np.ndarray:
+    """
+    Lee WAV PCM16, lo convierte a mono si hace falta y devuelve float32 [-1,1].
+    Si no es 16kHz, re-muestrea con ffmpeg portátil antes.
+    """
+    # 1) abre para ver samplerate/canales
+    with wave.open(path, "rb") as wf:
+        sr = wf.getframerate()
+        ch = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        if sampwidth != 2:
+            raise RuntimeError("Se esperaba WAV PCM 16-bit (sampwidth=2).")
+    if sr != 16000 or ch != 1:
+        fixed = path + ".fixed.wav"
+        run_ffmpeg(["-y", "-i", path, "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", fixed])
+        path = fixed
+
+    with wave.open(path, "rb") as wf:
+        frames = wf.readframes(wf.getnframes())
+        audio_i16 = np.frombuffer(frames, dtype=np.int16)
+        audio_f32 = audio_i16.astype(np.float32) / 32768.0
+        return audio_f32
 
 # =============================================================================
 # FFmpeg portátil (NO depende del sistema)
@@ -134,16 +157,7 @@ def load_whisper(model_size: str):
     return whisper.load_model(model_size, device="cpu")
 
 def transcribe_audio(audio_wav: str, model_size="small") -> str:
-    sr, pcm = wavfile.read(audio_wav)
-    if pcm.ndim > 1:
-        pcm = pcm[:, 0]
-    if sr != 16000:
-        fixed = audio_wav + ".16k.wav"
-        run_ffmpeg(["-y", "-i", audio_wav, "-ac", "1", "-ar", "16000",
-                    "-acodec", "pcm_s16le", fixed])
-        sr, pcm = wavfile.read(fixed)
-    audio = pcm.astype(np.float32) / 32768.0
-
+    audio = read_wav_mono16k(audio_wav)
     model = load_whisper(model_size)
     result = model.transcribe(
         audio,
