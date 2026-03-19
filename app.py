@@ -1,11 +1,11 @@
 # app.py — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
-# EN → ES (Azure Translator) + Doblaje (Azure Speech TTS) + Whisper (ASR)
+# EN → ES con Azure Translator + Doblaje con Azure Speech + Whisper (ASR)
 #
 # Incluye:
-#  - Título con banderas (Twemoji) estable en cualquier SO/Cloud
-#  - Fuente de vídeo: URL/ruta, carpeta local (si ejecutas en tu PC), o subir archivo
-#  - Acciones: Obtener texto EN, obtener traducción ES, o doblar vídeo
-#  - Tras transcribir/traducir, permite doblar SIN volver a pulsar "Procesar"
+#  - Título con banderas (Twemoji)
+#  - Fuente de vídeo: URL/ruta o Subir archivo
+#  - Acciones: Obtener texto EN / Obtener traducción ES / Hacer doblaje
+#  - Tras transcribir o traducir, permite doblar SIN volver a pulsar "Procesar"
 #  - ffmpeg portátil con imageio-ffmpeg
 #  - Whisper sin ffmpeg interno (le pasamos audio como numpy)
 #  - Doblaje sincronizado por clústeres (timestamps Whisper) + ajuste de rate SSML
@@ -56,7 +56,10 @@ def setup_portable_ffmpeg() -> str:
         os.environ["PATH"] = ff_dir + os.pathsep + os.environ.get("PATH", "")
         os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
 
+    # pydub necesita saber dónde está ffmpeg
     AudioSegment.converter = FFMPEG_BIN
+
+    # silenciar warning típico de pydub
     warnings.filterwarnings(
         "ignore",
         message="Couldn't find ffmpeg or avconv*",
@@ -71,6 +74,7 @@ def run_ffmpeg(args: List[str]):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def parse_duration_from_ffmpeg(path: str) -> float:
+    """Duración sin ffprobe: parsea stderr de `ffmpeg -i`."""
     try:
         p = subprocess.run([FFMPEG_BIN, "-hide_banner", "-i", path],
                            capture_output=True, text=True)
@@ -83,6 +87,7 @@ def parse_duration_from_ffmpeg(path: str) -> float:
         return 0.0
 
 def ensure_video_ok(video_path: str) -> str:
+    """Remux/reencode a MP4 si hace falta para duraciones fiables."""
     dur = parse_duration_from_ffmpeg(video_path)
     if dur > 0.1 and video_path.lower().endswith(".mp4"):
         return video_path
@@ -120,7 +125,8 @@ AZURE_TRANSLATOR_REGION = get_secret("AZURE_TRANSLATOR_REGION")
 AZURE_SPEECH_KEY = get_secret("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = get_secret("AZURE_SPEECH_REGION")
 
-# Si no defines claves específicas del traductor, reutiliza Speech Key/Region (si tu recurso lo permite)
+# Fallback opcional (no siempre funciona): si no defines traductor, prueba con Speech
+# (Solo si tu organización ha configurado un recurso que comparta credenciales)
 if not AZURE_TRANSLATOR_KEY:
     AZURE_TRANSLATOR_KEY = AZURE_SPEECH_KEY
 if not AZURE_TRANSLATOR_REGION:
@@ -154,7 +160,7 @@ def render_title_text_first():
 
 
 # =============================================================================
-# Entrada vídeo: URL/ruta, carpeta local, subir archivo
+# Entrada vídeo: URL/ruta o subir archivo
 # =============================================================================
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -163,6 +169,7 @@ def _is_youtube(url: str) -> bool:
     return bool(re.search(r"(youtube\.com|youtu\.be)", url or "", re.I))
 
 def download_youtube(url: str) -> str:
+    """Descarga YouTube con yt-dlp. En Cloud puede fallar por 403; usa subir archivo si pasa."""
     outtmpl = "%(id)s.%(ext)s"
     ydl_opts = {
         "outtmpl": outtmpl,
@@ -187,6 +194,7 @@ def download_youtube(url: str) -> str:
     return ensure_video_ok(fn)
 
 def download_direct_http(url: str) -> str:
+    """Descarga HTTP directa (mp4/webm)."""
     tmp = Path(tempfile.gettempdir()) / f"video_{int(time.time())}.bin"
     with requests.get(url, stream=True, timeout=60, headers={"User-Agent": UA}) as r:
         r.raise_for_status()
@@ -224,6 +232,7 @@ def extract_audio(video_file: str, audio_file="audio.wav") -> str:
     return audio_file
 
 def read_wav_mono16k(path: str) -> np.ndarray:
+    """Lee WAV PCM16 y devuelve float32 [-1,1] mono 16k."""
     with wave.open(path, "rb") as wf:
         sr = wf.getframerate()
         ch = wf.getnchannels()
@@ -265,7 +274,10 @@ def transcribe_with_segments(audio_wav: str, model_size: str) -> Tuple[List[Dict
 # =============================================================================
 def azure_translate_batch(texts: List[str], from_lang="en", to_lang="es") -> List[str]:
     if not AZURE_TRANSLATOR_KEY or not AZURE_TRANSLATOR_REGION:
-        raise RuntimeError("Faltan AZURE_TRANSLATOR_KEY / AZURE_TRANSLATOR_REGION (Secrets/ENV). Puedes usar las mismas que AZURE_SPEECH_KEY / AZURE_SPEECH_REGION si tu configuración lo permite.")
+        raise RuntimeError(
+            "Faltan AZURE_TRANSLATOR_KEY / AZURE_TRANSLATOR_REGION (Secrets/ENV). "
+            "Normalmente NO son las mismas que Speech."
+        )
 
     endpoint = "https://api.cognitive.microsofttranslator.com"
     path = "/translate"
@@ -341,6 +353,7 @@ def tts_ssml_bytes(text: str, voice: str, rate_pct: int) -> bytes:
         raise RuntimeError(f"Azure TTS falló: {res.reason}")
     return bytes(res.audio_data)
 
+# sincro
 SYNC_OFFSET_MS = 120
 JOIN_GAP_MS = 450
 CLUSTER_MAX_MS = 11000
@@ -502,3 +515,143 @@ st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True
 render_title_text_first()
 st.caption("por Miguel Ángel Gómez Ortiz")
 
+fuente = st.radio("Fuente del vídeo", ["URL / ruta", "Subir archivo"], horizontal=True)
+
+source = ""
+uploaded_path = None
+
+if fuente == "URL / ruta":
+    source = st.text_input("🔗 URL (YouTube o mp4 directo) o 📁 ruta local al vídeo")
+
+else:
+    up = st.file_uploader("Sube un vídeo (mp4/mkv/webm/mov/m4v)", type=["mp4", "mkv", "webm", "mov", "m4v"])
+    if up is not None:
+        tmp = Path(tempfile.gettempdir()) / up.name
+        tmp.write_bytes(up.read())
+        uploaded_path = str(tmp)
+
+accion = st.radio("Acción", ["Obtener el texto en inglés", "Obtener la traducción a español", "Hacer el doblaje del video"], index=2)
+
+colA, colB = st.columns(2)
+with colA:
+    model_size = st.selectbox("Modelo Whisper", ["base", "small", "medium"], index=1)
+with colB:
+    voice = st.selectbox("Voz Azure (ES)", ["es-ES-DarioNeural", "es-ES-AlvaroNeural", "es-ES-ElviraNeural", "es-ES-TeoNeural"], index=0)
+
+def reset_session_outputs():
+    for k in ["video_file", "audio_file", "segments", "transcript_en", "texts_es", "transcript_es_full", "video_out"]:
+        st.session_state.pop(k, None)
+
+if st.button("Procesar"):
+    reset_session_outputs()
+    try:
+        with st.spinner("Preparando vídeo..."):
+            video_file = resolve_source(source, uploaded_path)
+            st.session_state["video_file"] = video_file
+
+        with st.spinner("Extrayendo audio..."):
+            audio_file = extract_audio(video_file, "audio.wav")
+            st.session_state["audio_file"] = audio_file
+
+        with st.spinner("Transcribiendo (Whisper)..."):
+            segments, transcript_en = transcribe_with_segments(audio_file, model_size)
+            st.session_state["segments"] = segments
+            st.session_state["transcript_en"] = transcript_en
+
+        st.success("✅ Transcripción lista")
+
+        if accion == "Obtener el texto en inglés":
+            st.subheader("📝 Transcripción (EN)")
+            st.write(st.session_state["transcript_en"])
+            st.download_button("⬇️ Descargar EN (.txt)",
+                               st.session_state["transcript_en"].encode("utf-8"),
+                               file_name="transcripcion_en.txt",
+                               mime="text/plain")
+
+        elif accion == "Obtener la traducción a español":
+            with st.spinner("Traduciendo (Azure Translator)..."):
+                es_full = translate_fulltext_azure(st.session_state["transcript_en"])
+                st.session_state["transcript_es_full"] = es_full
+                prog = st.progress(0.0)
+                texts_en = [(s.get("text") or "").strip() for s in st.session_state["segments"]]
+                texts_es = translate_segments_azure(texts_en, progress=prog)
+                prog.empty()
+                st.session_state["texts_es"] = texts_es
+
+            st.subheader("🌍 Traducción (ES)")
+            st.write(st.session_state["transcript_es_full"])
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("⬇️ EN (.txt)",
+                                   st.session_state["transcript_en"].encode("utf-8"),
+                                   file_name="transcripcion_en.txt",
+                                   mime="text/plain")
+            with c2:
+                st.download_button("⬇️ ES (.txt)",
+                                   st.session_state["transcript_es_full"].encode("utf-8"),
+                                   file_name="traduccion_es.txt",
+                                   mime="text/plain")
+
+        else:
+            with st.spinner("Traduciendo segmentos (Azure Translator)..."):
+                prog = st.progress(0.0)
+                texts_en = [(s.get("text") or "").strip() for s in st.session_state["segments"]]
+                texts_es = translate_segments_azure(texts_en, progress=prog)
+                prog.empty()
+                st.session_state["texts_es"] = texts_es
+
+            with st.spinner("Generando doblaje y sincronizando..."):
+                prog2 = st.progress(0.0)
+                wav_tl = build_dubbed_timeline(st.session_state["video_file"],
+                                               st.session_state["segments"],
+                                               st.session_state["texts_es"],
+                                               voice,
+                                               progress=prog2)
+                prog2.empty()
+
+            with st.spinner("Montando vídeo final..."):
+                out = mux_video_audio(st.session_state["video_file"], wav_tl, "video_doblado.mp4")
+                st.session_state["video_out"] = out
+
+            st.success("✅ Doblaje listo")
+            st.video(st.session_state["video_out"])
+            st.download_button("⬇️ Descargar video doblado",
+                               open(st.session_state["video_out"], "rb"),
+                               file_name="video_doblado.mp4")
+
+    except Exception as e:
+        st.error(str(e))
+
+can_dub = ("video_file" in st.session_state) and ("segments" in st.session_state) and ("transcript_en" in st.session_state)
+if can_dub:
+    st.divider()
+    st.markdown("### 🎙️ Doblaje sin reprocesar")
+    if st.button("Hacer doblaje ahora (usando lo ya transcrito/traducido)"):
+        try:
+            if "texts_es" not in st.session_state:
+                with st.spinner("Traduciendo segmentos (Azure Translator)..."):
+                    prog = st.progress(0.0)
+                    texts_en = [(s.get("text") or "").strip() for s in st.session_state["segments"]]
+                    st.session_state["texts_es"] = translate_segments_azure(texts_en, progress=prog)
+                    prog.empty()
+
+            with st.spinner("Generando doblaje y sincronizando..."):
+                prog2 = st.progress(0.0)
+                wav_tl = build_dubbed_timeline(st.session_state["video_file"],
+                                               st.session_state["segments"],
+                                               st.session_state["texts_es"],
+                                               voice,
+                                               progress=prog2)
+                prog2.empty()
+
+            with st.spinner("Montando vídeo final..."):
+                out = mux_video_audio(st.session_state["video_file"], wav_tl, "video_doblado.mp4")
+                st.session_state["video_out"] = out
+
+            st.success("✅ Doblaje listo")
+            st.video(st.session_state["video_out"])
+            st.download_button("⬇️ Descargar video doblado",
+                               open(st.session_state["video_out"], "rb"),
+                               file_name="video_doblado.mp4")
+        except Exception as e:
+            st.error(str(e))
