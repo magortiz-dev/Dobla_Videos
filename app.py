@@ -313,14 +313,10 @@ def azure_translate_batch(texts: List[str], from_lang="en", to_lang="es") -> Lis
         # Mensaje más útil para 401
         if r.status_code == 401:
             raise RuntimeError(
-                "Azure Translator falló (401). Revisa:
-"
-                "1) Que AZURE_TRANSLATOR_KEY sea la Key del recurso Translator.
-"
-                "2) Si tu recurso NO es global, que AZURE_TRANSLATOR_REGION coincida EXACTO con 'Location' en Azure.
-"
-                "3) Si usas subdominio/VNET, define AZURE_TRANSLATOR_ENDPOINT.
-"
+                "Azure Translator falló (401). Revisa:\\n"
+                "1) Que AZURE_TRANSLATOR_KEY sea la Key del recurso Translator.\\n"
+                "2) Si tu recurso NO es global, que AZURE_TRANSLATOR_REGION coincida EXACTO con 'Location' en Azure.\\n"
+                "3) Si usas subdominio/VNET, define AZURE_TRANSLATOR_ENDPOINT.\\n"
                 f"Respuesta: {r.text[:800]}"
             )
         raise RuntimeError(f"Azure Translator falló ({r.status_code}): {r.text[:800]}")
