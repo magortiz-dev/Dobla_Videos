@@ -111,13 +111,21 @@ def ensure_video_ok(video_path: str) -> str:
 # Secrets / ENV
 # =============================================================================
 def get_secret(name: str) -> Optional[str]:
+    """
+    Lee secretos desde ENV o st.secrets (Streamlit Cloud).
+    Importante: st.secrets es un AttrDict y puede NO tener .get().
+    """
     v = os.getenv(name)
     if isinstance(v, str) and v.strip():
         return v.strip()
     try:
-        return st.secrets.get(name)  # type: ignore[attr-defined]
+        v2 = st.secrets[name]  # type: ignore[index]
+        if isinstance(v2, str) and v2.strip():
+            return v2.strip()
     except Exception:
-        return None
+        pass
+    return None
+
 
 AZURE_TRANSLATOR_KEY = get_secret("AZURE_TRANSLATOR_KEY")
 AZURE_TRANSLATOR_REGION = get_secret("AZURE_TRANSLATOR_REGION")
