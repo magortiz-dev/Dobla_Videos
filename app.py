@@ -126,12 +126,6 @@ AZURE_TRANSLATOR_ENDPOINT = get_secret("AZURE_TRANSLATOR_ENDPOINT")
 AZURE_SPEECH_KEY = get_secret("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = get_secret("AZURE_SPEECH_REGION")
 
-# Fallback opcional (no siempre funciona): si no defines traductor, prueba con Speech
-# (Solo si tu organización ha configurado un recurso que comparta credenciales)
-if not AZURE_TRANSLATOR_KEY:
-    AZURE_TRANSLATOR_KEY = AZURE_SPEECH_KEY
-if not AZURE_TRANSLATOR_REGION:
-    AZURE_TRANSLATOR_REGION = AZURE_SPEECH_REGION
 
 
 # =============================================================================
@@ -274,18 +268,20 @@ def transcribe_with_segments(audio_wav: str, model_size: str) -> Tuple[List[Dict
 # Azure Translator (batch)
 # =============================================================================
 
+
 def azure_translate_batch(texts: List[str], from_lang="en", to_lang="es") -> List[str]:
     if not AZURE_TRANSLATOR_KEY:
         raise RuntimeError(
-            "Falta AZURE_TRANSLATOR_KEY. Debe ser la Key del recurso Translator (no la de Speech)."
+            "Falta AZURE_TRANSLATOR_KEY (en Secrets/ENV). "
+            "Debe ser la Key del recurso Translator (no la de Speech)."
+        )
+    if not AZURE_TRANSLATOR_REGION:
+        raise RuntimeError(
+            "Falta AZURE_TRANSLATOR_REGION (en Secrets/ENV). "
+            "Para tu caso debe ser: westeurope."
         )
 
-    # Endpoint:
-    # - Si defines AZURE_TRANSLATOR_ENDPOINT, úsalo.
-    #   * Global: https://api.cognitive.microsofttranslator.com
-    #   * Custom subdomain/VNET: https://<subdominio>.cognitiveservices.azure.com
     endpoint = (AZURE_TRANSLATOR_ENDPOINT or "https://api.cognitive.microsofttranslator.com").rstrip("/")
-
     # Path correcto según endpoint
     if "cognitiveservices.azure.com" in endpoint:
         url = endpoint + "/translator/text/v3.0/translate"
@@ -300,23 +296,28 @@ def azure_translate_batch(texts: List[str], from_lang="en", to_lang="es") -> Lis
         "X-ClientTraceId": str(uuid.uuid4()),
     }
 
-    # Región:
-    # - Para recurso "global" es opcional (y a veces conviene omitirla)
-    # - Para recursos regionales / multi-servicio suele ser obligatoria
-    if AZURE_TRANSLATOR_REGION and AZURE_TRANSLATOR_REGION.lower() != "global":
-        headers["Ocp-Apim-Subscription-Region"] = AZURE_TRANSLATOR_REGION
+    # En recursos regionales como westeurope: obligatorio
+    headers["Ocp-Apim-Subscription-Region"] = AZURE_TRANSLATOR_REGION
 
     body = [{"text": (t or "")} for t in texts]
 
     r = requests.post(url, params=params, headers=headers, json=body, timeout=120)
     if r.status_code != 200:
-        # Mensaje más útil para 401
         if r.status_code == 401:
+            # Mensaje de diagnóstico sin exponer la key
+            key_len = len(AZURE_TRANSLATOR_KEY or "")
+            key_tail = (AZURE_TRANSLATOR_KEY or "")[-6:]
             raise RuntimeError(
-                "Azure Translator falló (401). Revisa:\\n"
-                "1) Que AZURE_TRANSLATOR_KEY sea la Key del recurso Translator.\\n"
-                "2) Si tu recurso NO es global, que AZURE_TRANSLATOR_REGION coincida EXACTO con 'Location' en Azure.\\n"
-                "3) Si usas subdominio/VNET, define AZURE_TRANSLATOR_ENDPOINT.\\n"
+                "Azure Translator falló (401). Revisa:
+"
+                "• Que AZURE_TRANSLATOR_KEY sea la CLAVE del recurso Translator (Keys and Endpoint → Clave 1/2).
+"
+                "• Que AZURE_TRANSLATOR_REGION sea exactamente: westeurope.
+"
+                "• Si tienes redes restringidas / endpoint privado, define AZURE_TRANSLATOR_ENDPOINT con tu subdominio.
+"
+                f"Diagnóstico: endpoint={endpoint}  region={AZURE_TRANSLATOR_REGION}  key_len={key_len}  key_tail=...{key_tail}
+"
                 f"Respuesta: {r.text[:800]}"
             )
         raise RuntimeError(f"Azure Translator falló ({r.status_code}): {r.text[:800]}")
