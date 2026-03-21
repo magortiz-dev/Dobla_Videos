@@ -308,16 +308,11 @@ def azure_translate_batch(texts: List[str], from_lang="en", to_lang="es") -> Lis
             key_len = len(AZURE_TRANSLATOR_KEY or "")
             key_tail = (AZURE_TRANSLATOR_KEY or "")[-6:]
             raise RuntimeError(
-                "Azure Translator falló (401). Revisa:
-"
-                "• Que AZURE_TRANSLATOR_KEY sea la CLAVE del recurso Translator (Keys and Endpoint → Clave 1/2).
-"
-                "• Que AZURE_TRANSLATOR_REGION sea exactamente: westeurope.
-"
-                "• Si tienes redes restringidas / endpoint privado, define AZURE_TRANSLATOR_ENDPOINT con tu subdominio.
-"
-                f"Diagnóstico: endpoint={endpoint}  region={AZURE_TRANSLATOR_REGION}  key_len={key_len}  key_tail=...{key_tail}
-"
+                "Azure Translator falló (401). Revisa:\n"
+                "• Que AZURE_TRANSLATOR_KEY sea la CLAVE del recurso Translator (Keys and Endpoint → Clave 1/2).\n"
+                "• Que AZURE_TRANSLATOR_REGION sea exactamente: westeurope.\n"
+                "• Si tienes redes restringidas / endpoint privado, define AZURE_TRANSLATOR_ENDPOINT con tu subdominio.\n"
+                f"Diagnóstico: endpoint={endpoint}  region={AZURE_TRANSLATOR_REGION}  key_len={key_len}  key_tail=...{key_tail}\n"
                 f"Respuesta: {r.text[:800]}"
             )
         raise RuntimeError(f"Azure Translator falló ({r.status_code}): {r.text[:800]}")
