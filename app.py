@@ -113,18 +113,43 @@ def ensure_video_ok(video_path: str) -> str:
 def get_secret(name: str) -> Optional[str]:
     """
     Lee secretos desde ENV o st.secrets (Streamlit Cloud).
-    Importante: st.secrets es un AttrDict y puede NO tener .get().
+    Soporta:
+      - claves en raíz: st.secrets["AZURE_TRANSLATOR_KEY"]
+      - claves dentro de secciones: [azure] AZURE_TRANSLATOR_KEY="..."
     """
     v = os.getenv(name)
     if isinstance(v, str) and v.strip():
         return v.strip()
+
+    # Streamlit Cloud secrets (raíz)
     try:
         v2 = st.secrets[name]  # type: ignore[index]
         if isinstance(v2, str) and v2.strip():
             return v2.strip()
     except Exception:
         pass
+
+    # Búsqueda en secciones
+    try:
+        for k in st.secrets:  # type: ignore[operator]
+            try:
+                section = st.secrets[k]  # type: ignore[index]
+            except Exception:
+                continue
+            if isinstance(section, str):
+                continue
+            try:
+                if name in section:
+                    v3 = section[name]
+                    if isinstance(v3, str) and v3.strip():
+                        return v3.strip()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     return None
+
 
 
 AZURE_TRANSLATOR_KEY = get_secret("AZURE_TRANSLATOR_KEY")
@@ -279,9 +304,14 @@ def transcribe_with_segments(audio_wav: str, model_size: str) -> Tuple[List[Dict
 
 def azure_translate_batch(texts: List[str], from_lang="en", to_lang="es") -> List[str]:
     if not AZURE_TRANSLATOR_KEY:
+        available = []
+        try:
+            available = list(st.secrets.keys())  # type: ignore[attr-defined]
+        except Exception:
+            available = []
         raise RuntimeError(
-            "Falta AZURE_TRANSLATOR_KEY (en Secrets/ENV). "
-            "Debe ser la Key del recurso Translator (no la de Speech)."
+            "Falta AZURE_TRANSLATOR_KEY (en Secrets/ENV). Debe ser la Key del recurso Translator (no la de Speech).\n"
+            f"Claves detectadas en st.secrets: {available}"
         )
     if not AZURE_TRANSLATOR_REGION:
         raise RuntimeError(
@@ -543,11 +573,14 @@ def mux_video_audio(video_file: str, audio_wav: str, output="video_doblado.mp4")
 # =============================================================================
 # Streamlit UI
 # =============================================================================
+APP_VERSION = "v9"
+
 st.set_page_config(page_title="Doblador EN→ES (Azure)", page_icon="🎬", layout="centered")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
 render_title_text_first()
 st.caption("por Miguel Ángel Gómez Ortiz")
+st.caption(f"build: {APP_VERSION}")
 
 fuente = st.radio("Fuente del vídeo", ["URL / ruta", "Subir archivo"], horizontal=True)
 
