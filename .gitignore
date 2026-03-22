@@ -5,5 +5,7 @@ secrets.toml
 __pycache__/
 ffmpeg/
 *.zip
-*.mp4
 *.wav
+.DS_Store
+Thumbs.db
+*.log
