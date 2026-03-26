@@ -1,22 +1,19 @@
-# app.py — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
+# app.py (v11) — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
 # EN → ES con Azure Translator + Doblaje con Azure Speech + Whisper (ASR)
 #
-# Incluye:
-#  - Título con banderas (Twemoji)
-#  - Fuente de vídeo: URL/ruta o Subir archivo
-#  - Acciones: Obtener texto EN / Obtener traducción ES / Hacer doblaje
-#  - Tras transcribir o traducir, permite doblar SIN volver a pulsar "Procesar"
-#  - ffmpeg portátil con imageio-ffmpeg
-#  - Whisper sin ffmpeg interno (le pasamos audio como numpy)
-#  - Doblaje sincronizado por clústeres (timestamps Whisper) + ajuste de rate SSML
+# Mejoras v11 (para tus ejemplos):
+#  - La traducción que SE VE y la que SE OYE es la MISMA (se traduce por "frases/clústeres", no por segmentos sueltos).
+#    Esto evita casos tipo: en pantalla "o incluso" pero en audio "ni siquiera".
+#  - Clustering EN más inteligente: une segmentos cuando NO hay fin de frase real (evita pausas en mitad).
+#  - Mantiene sincronización por timestamps, y ajusta ritmo si el TTS se pasa de su ventana.
 
 import os
 import re
 import io
 import uuid
-import shutil
 import time
 import wave
+import shutil
 import warnings
 import tempfile
 import subprocess
@@ -26,7 +23,6 @@ from typing import List, Dict, Tuple, Optional
 import requests
 import streamlit as st
 import numpy as np
-
 import yt_dlp
 import whisper
 
@@ -56,10 +52,7 @@ def setup_portable_ffmpeg() -> str:
         os.environ["PATH"] = ff_dir + os.pathsep + os.environ.get("PATH", "")
         os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
 
-    # pydub necesita saber dónde está ffmpeg
     AudioSegment.converter = FFMPEG_BIN
-
-    # silenciar warning típico de pydub
     warnings.filterwarnings(
         "ignore",
         message="Couldn't find ffmpeg or avconv*",
@@ -87,7 +80,6 @@ def parse_duration_from_ffmpeg(path: str) -> float:
         return 0.0
 
 def ensure_video_ok(video_path: str) -> str:
-    """Remux/reencode a MP4 si hace falta para duraciones fiables."""
     dur = parse_duration_from_ffmpeg(video_path)
     if dur > 0.1 and video_path.lower().endswith(".mp4"):
         return video_path
@@ -121,7 +113,6 @@ def get_secret(name: str) -> Optional[str]:
     if isinstance(v, str) and v.strip():
         return v.strip()
 
-    # Streamlit Cloud secrets (raíz)
     try:
         v2 = st.secrets[name]  # type: ignore[index]
         if isinstance(v2, str) and v2.strip():
@@ -129,7 +120,6 @@ def get_secret(name: str) -> Optional[str]:
     except Exception:
         pass
 
-    # Búsqueda en secciones
     try:
         for k in st.secrets:  # type: ignore[operator]
             try:
@@ -150,15 +140,12 @@ def get_secret(name: str) -> Optional[str]:
 
     return None
 
-
-
 AZURE_TRANSLATOR_KEY = get_secret("AZURE_TRANSLATOR_KEY")
-AZURE_TRANSLATOR_REGION = get_secret("AZURE_TRANSLATOR_REGION")
-AZURE_TRANSLATOR_ENDPOINT = get_secret("AZURE_TRANSLATOR_ENDPOINT")
+AZURE_TRANSLATOR_REGION = get_secret("AZURE_TRANSLATOR_REGION")  # westeurope
+AZURE_TRANSLATOR_ENDPOINT = get_secret("AZURE_TRANSLATOR_ENDPOINT")  # opcional (custom subdomain)
 
 AZURE_SPEECH_KEY = get_secret("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = get_secret("AZURE_SPEECH_REGION")
-
 
 
 # =============================================================================
@@ -197,7 +184,6 @@ def _is_youtube(url: str) -> bool:
     return bool(re.search(r"(youtube\.com|youtu\.be)", url or "", re.I))
 
 def download_youtube(url: str) -> str:
-    """Descarga YouTube con yt-dlp. En Cloud puede fallar por 403; usa subir archivo si pasa."""
     outtmpl = "%(id)s.%(ext)s"
     ydl_opts = {
         "outtmpl": outtmpl,
@@ -222,7 +208,6 @@ def download_youtube(url: str) -> str:
     return ensure_video_ok(fn)
 
 def download_direct_http(url: str) -> str:
-    """Descarga HTTP directa (mp4/webm)."""
     tmp = Path(tempfile.gettempdir()) / f"video_{int(time.time())}.bin"
     with requests.get(url, stream=True, timeout=60, headers={"User-Agent": UA}) as r:
         r.raise_for_status()
@@ -260,7 +245,6 @@ def extract_audio(video_file: str, audio_file="audio.wav") -> str:
     return audio_file
 
 def read_wav_mono16k(path: str) -> np.ndarray:
-    """Lee WAV PCM16 y devuelve float32 [-1,1] mono 16k."""
     with wave.open(path, "rb") as wf:
         sr = wf.getframerate()
         ch = wf.getnchannels()
@@ -298,68 +282,92 @@ def transcribe_with_segments(audio_wav: str, model_size: str) -> Tuple[List[Dict
 
 
 # =============================================================================
-# Azure Translator (batch)
+# Clustering EN (anti pausas) + Traducción Azure por frases
 # =============================================================================
+EN_STRONG_END_RE = re.compile(r'[.!?…]\s*$')
+EN_CONTINUATION_RE = re.compile(r'^(?:or|and|but|so|because|while|when|that|which|who|to|for|with|in|on|at)\b', re.I)
+
+def ends_strong_punct_en(s: str) -> bool:
+    return bool(EN_STRONG_END_RE.search((s or "").strip()))
+
+def looks_continuation_start_en(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    return (s[:1].islower()) or bool(EN_CONTINUATION_RE.search(s))
+
+JOIN_GAP_MS = 1200
+CLUSTER_MAX_MS = 18000
+
+def cluster_segments_en(segments: List[Dict]) -> List[Dict]:
+    clusters: List[Dict] = []
+    i = 0
+    n = len(segments)
+
+    while i < n:
+        start_ms = int(float(segments[i]["start"]) * 1000)
+        end_ms = int(float(segments[i]["end"]) * 1000)
+        parts = [((segments[i].get("text") or "").strip())]
+        j = i
+
+        while j + 1 < n:
+            gap_ms = int((float(segments[j+1]["start"]) - float(segments[j]["end"])) * 1000)
+            next_end = int(float(segments[j+1]["end"]) * 1000)
+            dur_if = next_end - start_ms
+
+            en_prev = (segments[j].get("text") or "").strip()
+            en_next = (segments[j+1].get("text") or "").strip()
+
+            # fin real de frase -> cortar (excepto '.' artificial)
+            if ends_strong_punct_en(en_prev) and not (gap_ms <= 650 and looks_continuation_start_en(en_next)):
+                break
+            if gap_ms > JOIN_GAP_MS:
+                break
+            if dur_if > CLUSTER_MAX_MS:
+                break
+
+            j += 1
+            end_ms = next_end
+            parts.append(en_next)
+
+        text_en = " ".join(p for p in parts if p).strip()
+        text_en = re.sub(r"\s{2,}", " ", text_en)
+        clusters.append({"start_ms": start_ms, "end_ms": end_ms, "text_en": text_en})
+        i = j + 1
+
+    return clusters
 
 
+# =============================================================================
+# Azure Translator
+# =============================================================================
 def azure_translate_batch(texts: List[str], from_lang="en", to_lang="es") -> List[str]:
     if not AZURE_TRANSLATOR_KEY:
-        available = []
-        try:
-            available = list(st.secrets.keys())  # type: ignore[attr-defined]
-        except Exception:
-            available = []
-        raise RuntimeError(
-            "Falta AZURE_TRANSLATOR_KEY (en Secrets/ENV). Debe ser la Key del recurso Translator (no la de Speech).\n"
-            f"Claves detectadas en st.secrets: {available}"
-        )
+        raise RuntimeError("Falta AZURE_TRANSLATOR_KEY (en Secrets/ENV).")
     if not AZURE_TRANSLATOR_REGION:
-        raise RuntimeError(
-            "Falta AZURE_TRANSLATOR_REGION (en Secrets/ENV). "
-            "Para tu caso debe ser: westeurope."
-        )
+        raise RuntimeError("Falta AZURE_TRANSLATOR_REGION (en Secrets/ENV).")
 
     endpoint = (AZURE_TRANSLATOR_ENDPOINT or "https://api.cognitive.microsofttranslator.com").rstrip("/")
-    # Path correcto según endpoint
     if "cognitiveservices.azure.com" in endpoint:
         url = endpoint + "/translator/text/v3.0/translate"
     else:
         url = endpoint + "/translate"
 
     params = {"api-version": "3.0", "from": from_lang, "to": to_lang}
-
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_TRANSLATOR_KEY,
+        "Ocp-Apim-Subscription-Region": AZURE_TRANSLATOR_REGION,
         "Content-type": "application/json",
         "X-ClientTraceId": str(uuid.uuid4()),
     }
-
-    # En recursos regionales como westeurope: obligatorio
-    headers["Ocp-Apim-Subscription-Region"] = AZURE_TRANSLATOR_REGION
-
     body = [{"text": (t or "")} for t in texts]
-
     r = requests.post(url, params=params, headers=headers, json=body, timeout=120)
     if r.status_code != 200:
-        if r.status_code == 401:
-            # Mensaje de diagnóstico sin exponer la key
-            key_len = len(AZURE_TRANSLATOR_KEY or "")
-            key_tail = (AZURE_TRANSLATOR_KEY or "")[-6:]
-            raise RuntimeError(
-                "Azure Translator falló (401). Revisa:\n"
-                "• Que AZURE_TRANSLATOR_KEY sea la CLAVE del recurso Translator (Keys and Endpoint → Clave 1/2).\n"
-                "• Que AZURE_TRANSLATOR_REGION sea exactamente: westeurope.\n"
-                "• Si tienes redes restringidas / endpoint privado, define AZURE_TRANSLATOR_ENDPOINT con tu subdominio.\n"
-                f"Diagnóstico: endpoint={endpoint}  region={AZURE_TRANSLATOR_REGION}  key_len={key_len}  key_tail=...{key_tail}\n"
-                f"Respuesta: {r.text[:800]}"
-            )
         raise RuntimeError(f"Azure Translator falló ({r.status_code}): {r.text[:800]}")
-
     data = r.json()
     return [item["translations"][0]["text"] for item in data]
 
-
-def translate_segments_azure(texts: List[str], progress=None) -> List[str]:
+def translate_list_azure(texts: List[str], progress=None) -> List[str]:
     BATCH = 40
     out: List[str] = []
     n = len(texts)
@@ -370,22 +378,9 @@ def translate_segments_azure(texts: List[str], progress=None) -> List[str]:
             progress.progress(min(1.0, (i + len(chunk)) / n))
     return out
 
-def translate_fulltext_azure(text: str) -> str:
-    words = (text or "").split()
-    chunks = []
-    cur = []
-    size = 0
-    for w in words:
-        if size + len(w) + 1 > 4500 and cur:
-            chunks.append(" ".join(cur))
-            cur = [w]
-            size = len(w) + 1
-        else:
-            cur.append(w)
-            size += len(w) + 1
-    if cur:
-        chunks.append(" ".join(cur))
-    return " ".join(azure_translate_batch(chunks, "en", "es"))
+def translate_clusters_azure(clusters_en: List[Dict], progress=None) -> List[str]:
+    texts = [(c.get("text_en") or "").strip() for c in clusters_en]
+    return translate_list_azure(texts, progress=progress)
 
 
 # =============================================================================
@@ -417,71 +412,14 @@ def tts_ssml_bytes(text: str, voice: str, rate_pct: int) -> bytes:
         raise RuntimeError(f"Azure TTS falló: {res.reason}")
     return bytes(res.audio_data)
 
-# sincro
 SYNC_OFFSET_MS = 120
-JOIN_GAP_MS = 750
-CLUSTER_MAX_MS = 15000
 GUARD_MS = 30
 TAIL_MARGIN_MS = 60
 MIN_WINDOW_MS = 300
+
 RATE_MIN_PCT = -12
 RATE_MAX_PCT = +20
 ATEMPO_LAST_RESORT = 1.20
-
-SENT_END_RE = re.compile(r'[.!?…:;]\s*$')
-TRAIL_STRIP_RE = re.compile(r"[.!?…:;]+[\"\']?\s*$")
-def strip_trailing_sentence_punct(s: str) -> str:
-    s = (s or '').strip()
-    return TRAIL_STRIP_RE.sub('', s).strip()
-
-
-def ends_strong_punct(s: str) -> bool:
-    return bool(SENT_END_RE.search((s or "").strip()))
-
-def cluster_by_english(segments: List[Dict], texts_es: List[str]) -> List[Dict]:
-    """
-    Agrupa segmentos Whisper en clústeres usando SOLO la puntuación del inglés.
-    Si se unen segmentos porque el inglés NO termina en puntuación fuerte, eliminamos
-    puntos/;/:/?! que el traductor pueda haber añadido al final de la parte previa,
-    para evitar pausas artificiales en mitad de una frase.
-    """
-    clusters: List[Dict] = []
-    i = 0
-    n = len(segments)
-
-    while i < n:
-        start_ms = int(float(segments[i]["start"]) * 1000)
-        end_ms = int(float(segments[i]["end"]) * 1000)
-        parts = [(texts_es[i] or "").strip()]
-        j = i
-
-        while j + 1 < n:
-            gap_ms = int((float(segments[j+1]["start"]) - float(segments[j]["end"])) * 1000)
-            next_end = int(float(segments[j+1]["end"]) * 1000)
-            dur_if = next_end - start_ms
-
-            en_prev = (segments[j].get("text") or "").strip()
-            if ends_strong_punct(en_prev):
-                break
-            if gap_ms > JOIN_GAP_MS:
-                break
-            if dur_if > CLUSTER_MAX_MS:
-                break
-
-            if parts:
-                parts[-1] = strip_trailing_sentence_punct(parts[-1])
-
-            j += 1
-            end_ms = next_end
-            parts.append((texts_es[j] or "").strip())
-
-        text = " ".join(p for p in parts if p).strip()
-        text = re.sub(r"\s{2,}", " ", text)
-        clusters.append({"start_ms": start_ms, "end_ms": end_ms, "text": text})
-        i = j + 1
-
-    return clusters
-
 
 def atempo_chain(factor: float) -> str:
     if factor <= 0:
@@ -497,8 +435,8 @@ def atempo_chain(factor: float) -> str:
 
 def tts_fit_to_window(text: str, voice: str, window_ms: int) -> AudioSegment:
     """
-    Genera audio para un clúster intentando que NO sobrepase la ventana (para no solapar).
-    Cambio clave: si el audio queda algo más corto, NO lo rellenamos con silencio.
+    Evita solapes: nunca sobrepasa la ventana.
+    Evita pausas artificiales: si queda corto, NO rellena con silencio.
     """
     attempt_rates = [-4, None, None]
     audio_seg: Optional[AudioSegment] = None
@@ -534,6 +472,7 @@ def tts_fit_to_window(text: str, voice: str, window_ms: int) -> AudioSegment:
         if dur_ms - window_ms <= 180:
             return audio_seg[:window_ms]
 
+    # último recurso: atempo suave
     if audio_seg is not None and len(audio_seg) > window_ms and last_bytes is not None:
         tmp_in = str(Path(tempfile.gettempdir()) / f"tts_in_{uuid.uuid4().hex}.wav")
         tmp_out = str(Path(tempfile.gettempdir()) / f"tts_out_{uuid.uuid4().hex}.wav")
@@ -551,20 +490,23 @@ def tts_fit_to_window(text: str, voice: str, window_ms: int) -> AudioSegment:
 
     return audio_seg if audio_seg is not None else AudioSegment.silent(duration=min(200, window_ms))
 
-
-def build_dubbed_timeline(video_file: str, segments: List[Dict], texts_es: List[str], voice: str, progress=None) -> str:
+def build_dubbed_timeline(video_file: str, clusters_en: List[Dict], clusters_es: List[str], voice: str, progress=None) -> str:
     vdur = parse_duration_from_ffmpeg(video_file)
     if vdur <= 0:
         raise RuntimeError("No se pudo medir la duración del vídeo (ffmpeg).")
     video_ms = int(vdur * 1000)
 
-    clusters = cluster_by_english(segments, texts_es)
+    if not clusters_en:
+        raise RuntimeError("No hay clústeres para doblaje.")
+    if len(clusters_en) != len(clusters_es):
+        raise RuntimeError("Desfase: número de clústeres EN y ES no coincide.")
+
     final = AudioSegment.silent(duration=video_ms + 200)
 
-    for idx, cl in enumerate(clusters):
-        start_nom = cl["start_ms"] + SYNC_OFFSET_MS
-        end_nom = cl["end_ms"]
-        next_start = (clusters[idx+1]["start_ms"] + SYNC_OFFSET_MS) if idx+1 < len(clusters) else video_ms
+    for idx, cl in enumerate(clusters_en):
+        start_nom = int(cl["start_ms"]) + SYNC_OFFSET_MS
+        end_nom = int(cl["end_ms"])
+        next_start = (int(clusters_en[idx+1]["start_ms"]) + SYNC_OFFSET_MS) if idx + 1 < len(clusters_en) else video_ms
 
         place_ms = max(0, start_nom)
         end_allowed = min(end_nom - TAIL_MARGIN_MS, next_start - GUARD_MS)
@@ -574,11 +516,12 @@ def build_dubbed_timeline(video_file: str, segments: List[Dict], texts_es: List[
             end_allowed = video_ms
         window_ms = max(150, end_allowed - place_ms)
 
-        speech = tts_fit_to_window(cl["text"], voice, window_ms)
+        text_es = re.sub(r"\s{2,}", " ", (clusters_es[idx] or "").strip())
+        speech = tts_fit_to_window(text_es, voice, window_ms)
         final = final.overlay(speech, position=place_ms)
 
-        if progress is not None and len(clusters):
-            progress.progress((idx + 1) / len(clusters))
+        if progress is not None and len(clusters_en):
+            progress.progress((idx + 1) / len(clusters_en))
 
     if len(final) > video_ms:
         final = final[:video_ms]
@@ -600,8 +543,7 @@ def mux_video_audio(video_file: str, audio_wav: str, output="video_doblado.mp4")
 # =============================================================================
 # Streamlit UI
 # =============================================================================
-APP_VERSION = "v10"
-
+APP_VERSION = "v11"
 st.set_page_config(page_title="Doblador EN→ES (Azure)", page_icon="🎬", layout="centered")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
@@ -615,7 +557,6 @@ uploaded_path = None
 
 if fuente == "URL / ruta":
     source = st.text_input("🔗 URL (YouTube o mp4 directo) o 📁 ruta local al vídeo")
-
 else:
     up = st.file_uploader("Sube un vídeo (mp4/mkv/webm/mov/m4v)", type=["mp4", "mkv", "webm", "mov", "m4v"])
     if up is not None:
@@ -632,7 +573,7 @@ with colB:
     voice = st.selectbox("Voz Azure (ES)", ["es-ES-DarioNeural", "es-ES-AlvaroNeural", "es-ES-ElviraNeural", "es-ES-TeoNeural"], index=0)
 
 def reset_session_outputs():
-    for k in ["video_file", "audio_file", "segments", "transcript_en", "texts_es", "transcript_es_full", "video_out"]:
+    for k in ["video_file", "audio_file", "segments", "clusters_en", "clusters_es", "transcript_en", "transcript_es_full", "video_out"]:
         st.session_state.pop(k, None)
 
 if st.button("Procesar"):
@@ -650,6 +591,7 @@ if st.button("Procesar"):
             segments, transcript_en = transcribe_with_segments(audio_file, model_size)
             st.session_state["segments"] = segments
             st.session_state["transcript_en"] = transcript_en
+            st.session_state["clusters_en"] = cluster_segments_en(segments)
 
         st.success("✅ Transcripción lista")
 
@@ -662,14 +604,12 @@ if st.button("Procesar"):
                                mime="text/plain")
 
         elif accion == "Obtener la traducción a español":
-            with st.spinner("Traduciendo (Azure Translator)..."):
-                es_full = translate_fulltext_azure(st.session_state["transcript_en"])
-                st.session_state["transcript_es_full"] = es_full
+            with st.spinner("Traduciendo frases (Azure Translator)..."):
                 prog = st.progress(0.0)
-                texts_en = [(s.get("text") or "").strip() for s in st.session_state["segments"]]
-                texts_es = translate_segments_azure(texts_en, progress=prog)
+                clusters_es = translate_clusters_azure(st.session_state["clusters_en"], progress=prog)
                 prog.empty()
-                st.session_state["texts_es"] = texts_es
+                st.session_state["clusters_es"] = clusters_es
+                st.session_state["transcript_es_full"] = " ".join(clusters_es).strip()
 
             st.subheader("🌍 Traducción (ES)")
             st.write(st.session_state["transcript_es_full"])
@@ -686,18 +626,17 @@ if st.button("Procesar"):
                                    mime="text/plain")
 
         else:
-            with st.spinner("Traduciendo segmentos (Azure Translator)..."):
+            with st.spinner("Traduciendo frases (Azure Translator)..."):
                 prog = st.progress(0.0)
-                texts_en = [(s.get("text") or "").strip() for s in st.session_state["segments"]]
-                texts_es = translate_segments_azure(texts_en, progress=prog)
+                clusters_es = translate_clusters_azure(st.session_state["clusters_en"], progress=prog)
                 prog.empty()
-                st.session_state["texts_es"] = texts_es
+                st.session_state["clusters_es"] = clusters_es
 
             with st.spinner("Generando doblaje y sincronizando..."):
                 prog2 = st.progress(0.0)
                 wav_tl = build_dubbed_timeline(st.session_state["video_file"],
-                                               st.session_state["segments"],
-                                               st.session_state["texts_es"],
+                                               st.session_state["clusters_en"],
+                                               st.session_state["clusters_es"],
                                                voice,
                                                progress=prog2)
                 prog2.empty()
@@ -715,24 +654,24 @@ if st.button("Procesar"):
     except Exception as e:
         st.error(str(e))
 
-can_dub = ("video_file" in st.session_state) and ("segments" in st.session_state) and ("transcript_en" in st.session_state)
+# Doblaje sin reprocesar (si ya transcribiste o tradujiste)
+can_dub = ("video_file" in st.session_state) and ("clusters_en" in st.session_state) and ("transcript_en" in st.session_state)
 if can_dub:
     st.divider()
     st.markdown("### 🎙️ Doblaje sin reprocesar")
     if st.button("Hacer doblaje ahora (usando lo ya transcrito/traducido)"):
         try:
-            if "texts_es" not in st.session_state:
-                with st.spinner("Traduciendo segmentos (Azure Translator)..."):
+            if "clusters_es" not in st.session_state:
+                with st.spinner("Traduciendo frases (Azure Translator)..."):
                     prog = st.progress(0.0)
-                    texts_en = [(s.get("text") or "").strip() for s in st.session_state["segments"]]
-                    st.session_state["texts_es"] = translate_segments_azure(texts_en, progress=prog)
+                    st.session_state["clusters_es"] = translate_clusters_azure(st.session_state["clusters_en"], progress=prog)
                     prog.empty()
 
             with st.spinner("Generando doblaje y sincronizando..."):
                 prog2 = st.progress(0.0)
                 wav_tl = build_dubbed_timeline(st.session_state["video_file"],
-                                               st.session_state["segments"],
-                                               st.session_state["texts_es"],
+                                               st.session_state["clusters_en"],
+                                               st.session_state["clusters_es"],
                                                voice,
                                                progress=prog2)
                 prog2.empty()
