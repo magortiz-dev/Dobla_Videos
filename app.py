@@ -419,8 +419,8 @@ def tts_ssml_bytes(text: str, voice: str, rate_pct: int) -> bytes:
 
 # sincro
 SYNC_OFFSET_MS = 120
-JOIN_GAP_MS = 450
-CLUSTER_MAX_MS = 11000
+JOIN_GAP_MS = 750
+CLUSTER_MAX_MS = 15000
 GUARD_MS = 30
 TAIL_MARGIN_MS = 60
 MIN_WINDOW_MS = 300
@@ -429,23 +429,37 @@ RATE_MAX_PCT = +20
 ATEMPO_LAST_RESORT = 1.20
 
 SENT_END_RE = re.compile(r'[.!?…:;]\s*$')
+TRAIL_STRIP_RE = re.compile(r"[.!?…:;]+[\"\']?\s*$")
+def strip_trailing_sentence_punct(s: str) -> str:
+    s = (s or '').strip()
+    return TRAIL_STRIP_RE.sub('', s).strip()
+
 
 def ends_strong_punct(s: str) -> bool:
     return bool(SENT_END_RE.search((s or "").strip()))
 
 def cluster_by_english(segments: List[Dict], texts_es: List[str]) -> List[Dict]:
-    clusters = []
+    """
+    Agrupa segmentos Whisper en clústeres usando SOLO la puntuación del inglés.
+    Si se unen segmentos porque el inglés NO termina en puntuación fuerte, eliminamos
+    puntos/;/:/?! que el traductor pueda haber añadido al final de la parte previa,
+    para evitar pausas artificiales en mitad de una frase.
+    """
+    clusters: List[Dict] = []
     i = 0
     n = len(segments)
+
     while i < n:
         start_ms = int(float(segments[i]["start"]) * 1000)
         end_ms = int(float(segments[i]["end"]) * 1000)
-        parts = [texts_es[i].strip()]
+        parts = [(texts_es[i] or "").strip()]
         j = i
+
         while j + 1 < n:
             gap_ms = int((float(segments[j+1]["start"]) - float(segments[j]["end"])) * 1000)
             next_end = int(float(segments[j+1]["end"]) * 1000)
             dur_if = next_end - start_ms
+
             en_prev = (segments[j].get("text") or "").strip()
             if ends_strong_punct(en_prev):
                 break
@@ -453,12 +467,21 @@ def cluster_by_english(segments: List[Dict], texts_es: List[str]) -> List[Dict]:
                 break
             if dur_if > CLUSTER_MAX_MS:
                 break
+
+            if parts:
+                parts[-1] = strip_trailing_sentence_punct(parts[-1])
+
             j += 1
             end_ms = next_end
-            parts.append(texts_es[j].strip())
-        clusters.append({"start_ms": start_ms, "end_ms": end_ms, "text": " ".join(p for p in parts if p)})
+            parts.append((texts_es[j] or "").strip())
+
+        text = " ".join(p for p in parts if p).strip()
+        text = re.sub(r"\s{2,}", " ", text)
+        clusters.append({"start_ms": start_ms, "end_ms": end_ms, "text": text})
         i = j + 1
+
     return clusters
+
 
 def atempo_chain(factor: float) -> str:
     if factor <= 0:
@@ -473,9 +496,13 @@ def atempo_chain(factor: float) -> str:
     return ",".join(chain)
 
 def tts_fit_to_window(text: str, voice: str, window_ms: int) -> AudioSegment:
+    """
+    Genera audio para un clúster intentando que NO sobrepase la ventana (para no solapar).
+    Cambio clave: si el audio queda algo más corto, NO lo rellenamos con silencio.
+    """
     attempt_rates = [-4, None, None]
-    audio_seg = None
-    last_bytes = None
+    audio_seg: Optional[AudioSegment] = None
+    last_bytes: Optional[bytes] = None
     used_rate = -4
 
     for rate in attempt_rates:
@@ -493,6 +520,7 @@ def tts_fit_to_window(text: str, voice: str, window_ms: int) -> AudioSegment:
                     rate = min(-4, dec)
                 else:
                     rate = used_rate
+
         rate = int(max(RATE_MIN_PCT, min(RATE_MAX_PCT, rate)))
         used_rate = rate
 
@@ -501,29 +529,28 @@ def tts_fit_to_window(text: str, voice: str, window_ms: int) -> AudioSegment:
         audio_seg = AudioSegment.from_file(io.BytesIO(data), format="wav")
         dur_ms = len(audio_seg)
 
-        if abs(dur_ms - window_ms) <= 200:
-            if dur_ms < window_ms:
-                audio_seg += AudioSegment.silent(duration=(window_ms - dur_ms))
-            elif dur_ms > window_ms:
-                audio_seg = audio_seg[:window_ms]
+        if dur_ms <= window_ms:
             return audio_seg
+        if dur_ms - window_ms <= 180:
+            return audio_seg[:window_ms]
 
-    if len(audio_seg) > window_ms:
+    if audio_seg is not None and len(audio_seg) > window_ms and last_bytes is not None:
         tmp_in = str(Path(tempfile.gettempdir()) / f"tts_in_{uuid.uuid4().hex}.wav")
         tmp_out = str(Path(tempfile.gettempdir()) / f"tts_out_{uuid.uuid4().hex}.wav")
         AudioSegment.from_file(io.BytesIO(last_bytes), format="wav").export(tmp_in, format="wav")
         factor = min(ATEMPO_LAST_RESORT, len(audio_seg) / float(window_ms))
         run_ffmpeg(["-y", "-i", tmp_in, "-filter:a", atempo_chain(factor), tmp_out])
-        audio_seg = AudioSegment.from_file(tmp_out)
-        if len(audio_seg) > window_ms:
-            audio_seg = audio_seg[:window_ms]
+        audio_seg2 = AudioSegment.from_file(tmp_out)
         try:
             os.remove(tmp_in); os.remove(tmp_out)
         except Exception:
             pass
-        return audio_seg
+        if len(audio_seg2) > window_ms:
+            audio_seg2 = audio_seg2[:window_ms]
+        return audio_seg2
 
-    return audio_seg + AudioSegment.silent(duration=(window_ms - len(audio_seg)))
+    return audio_seg if audio_seg is not None else AudioSegment.silent(duration=min(200, window_ms))
+
 
 def build_dubbed_timeline(video_file: str, segments: List[Dict], texts_es: List[str], voice: str, progress=None) -> str:
     vdur = parse_duration_from_ffmpeg(video_file)
@@ -573,14 +600,13 @@ def mux_video_audio(video_file: str, audio_wav: str, output="video_doblado.mp4")
 # =============================================================================
 # Streamlit UI
 # =============================================================================
-APP_VERSION = "v9"
+APP_VERSION = "v10"
 
 st.set_page_config(page_title="Doblador EN→ES (Azure)", page_icon="🎬", layout="centered")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
 render_title_text_first()
 st.caption("por Miguel Ángel Gómez Ortiz")
-st.caption(f"build: {APP_VERSION}")
 
 fuente = st.radio("Fuente del vídeo", ["URL / ruta", "Subir archivo"], horizontal=True)
 
