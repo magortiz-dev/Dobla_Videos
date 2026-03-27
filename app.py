@@ -1,8 +1,7 @@
 # app.py — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
 # EN → ES con Azure Translator + Doblaje con Azure Speech + Whisper (ASR)
 #
-# 
-#  - La traducción que SE VE y la que SE OYE es la MISMA (se traduce por "frases/clústeres", no por segmentos sueltos).
+# #  - La traducción que SE VE y la que SE OYE es la MISMA (se traduce por "frases/clústeres", no por segmentos sueltos).
 #  - Clustering EN más inteligente: une segmentos cuando NO hay fin de frase real (evita pausas en mitad).
 #  - Mantiene sincronización por timestamps, y ajusta ritmo si el TTS se pasa de su ventana.
 
@@ -457,6 +456,52 @@ def translate_clusters_azure(clusters_en: List[Dict], progress=None) -> List[str
     texts = [(c.get("text_en") or "").strip() for c in clusters_en]
     return translate_list_azure(texts, progress=progress)
 
+# --- Merge ES clústeres si la frase continúa (evita pausas tipo "imágenes ... o vídeos") ---
+ES_CONTINUATION_START_RE = re.compile(r'^(?:o|y|e|u|pero|sino|porque|aunque|mientras|cuando|que|con|para|por|en)\b', re.I)
+ES_STRONG_END_RE = re.compile(r'[.!?…]\s*$')
+
+def merge_clusters_for_continuity(clusters_en: List[Dict], clusters_es: List[str]) -> tuple[List[Dict], List[str]]:
+    """
+    Une clústeres adyacentes cuando en español suena como continuación (sin punto/coma real),
+    para evitar pausas artificiales en mitad de una frase.
+    """
+    if not clusters_en or not clusters_es:
+        return clusters_en, clusters_es
+    if len(clusters_en) != len(clusters_es):
+        return clusters_en, clusters_es
+
+    out_en: List[Dict] = []
+    out_es: List[str] = []
+
+    i = 0
+    n = len(clusters_en)
+    while i < n:
+        cur_en = dict(clusters_en[i])
+        cur_es = (clusters_es[i] or "").strip()
+
+        while i + 1 < n:
+            nxt_en = clusters_en[i+1]
+            nxt_es = (clusters_es[i+1] or "").strip()
+
+            gap_ms = int(nxt_en["start_ms"]) - int(cur_en["end_ms"])
+            prev_strong = bool(ES_STRONG_END_RE.search(cur_es))
+            nxt_cont = (nxt_es[:1].islower()) or bool(ES_CONTINUATION_START_RE.search(nxt_es))
+
+            if (gap_ms <= 900) and (not prev_strong) and nxt_cont:
+                cur_en["end_ms"] = int(nxt_en["end_ms"])
+                cur_en["text_en"] = (cur_en.get("text_en","").rstrip() + " " + (nxt_en.get("text_en","").lstrip())).strip()
+                cur_es = re.sub(r'[;:,.]\s*$', '', cur_es).strip()
+                cur_es = (cur_es + " " + nxt_es).strip()
+                i += 1
+            else:
+                break
+
+        out_en.append(cur_en)
+        out_es.append(re.sub(r'\s{2,}', ' ', cur_es).strip())
+        i += 1
+
+    return out_en, out_es
+
 
 # =============================================================================
 # Azure Speech TTS + sincro por clústeres
@@ -487,7 +532,7 @@ def tts_ssml_bytes(text: str, voice: str, rate_pct: int) -> bytes:
         raise RuntimeError(f"Azure TTS falló: {res.reason}")
     return bytes(res.audio_data)
 
-SYNC_OFFSET_MS = 120
+SYNC_OFFSET_MS = 0
 GUARD_MS = 30
 TAIL_MARGIN_MS = 60
 MIN_WINDOW_MS = 300
@@ -683,7 +728,13 @@ if st.button("Procesar"):
                 clusters_es = translate_clusters_azure(st.session_state["clusters_en"], progress=prog)
                 prog.empty()
                 st.session_state["clusters_es"] = clusters_es
-                st.session_state["transcript_es_full"] = " ".join(clusters_es).strip()
+                st.session_state["clusters_en"], st.session_state["clusters_es"] = merge_clusters_for_continuity(
+                    st.session_state["clusters_en"], st.session_state["clusters_es"]
+                )
+                st.session_state["clusters_en"], st.session_state["clusters_es"] = merge_clusters_for_continuity(
+                    st.session_state["clusters_en"], st.session_state["clusters_es"]
+                )
+                st.session_state["transcript_es_full"] = " ".join(st.session_state["clusters_es"]).strip()
 
             st.subheader("🌍 Traducción (ES)")
             st.write(st.session_state["transcript_es_full"])
@@ -740,6 +791,9 @@ if can_dub:
                     prog = st.progress(0.0)
                     st.session_state["clusters_es"] = translate_clusters_azure(st.session_state["clusters_en"], progress=prog)
                     prog.empty()
+                    st.session_state["clusters_en"], st.session_state["clusters_es"] = merge_clusters_for_continuity(
+                        st.session_state["clusters_en"], st.session_state["clusters_es"]
+                    )
 
             with st.spinner("Generando doblaje y sincronizando..."):
                 prog2 = st.progress(0.0)
