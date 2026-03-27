@@ -1,9 +1,8 @@
-# app.py (v11) — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
+# app.py — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
 # EN → ES con Azure Translator + Doblaje con Azure Speech + Whisper (ASR)
 #
-# Mejoras v11 (para tus ejemplos):
+# 
 #  - La traducción que SE VE y la que SE OYE es la MISMA (se traduce por "frases/clústeres", no por segmentos sueltos).
-#    Esto evita casos tipo: en pantalla "o incluso" pero en audio "ni siquiera".
 #  - Clustering EN más inteligente: une segmentos cuando NO hay fin de frase real (evita pausas en mitad).
 #  - Mantiene sincronización por timestamps, y ajusta ritmo si el TTS se pasa de su ventana.
 
@@ -338,6 +337,62 @@ def cluster_segments_en(segments: List[Dict]) -> List[Dict]:
     return clusters
 
 
+
+# --- Glosario/terminología (mejora traducción en contexto GenAI) ---
+# Objetivo: evitar traducciones erróneas tipo "prompts" -> "propone temas".
+# Puedes ampliar este glosario con otros términos internos de la empresa.
+GLOSSARY_PHRASES_EN_ES = {
+    "meaningful prompts": "prompts con sentido",
+    "meaningful prompt": "prompt con sentido",
+}
+GLOSSARY_TERMS_EN_ES = {
+    "prompts": "prompts",
+    "prompt": "prompt",
+    "generative ai": "IA generativa",
+}
+
+def _protect_glossary_text(en_text: str, text_idx: int) -> tuple[str, dict[str, str]]:
+    """
+    Reemplaza términos/frases por tokens ASCII (no traducibles) para mantenerlos
+    y reinsertarlos en español después de traducir.
+    """
+    t = (en_text or "").strip()
+    mapping: dict[str, str] = {}
+
+    # Frases primero (más específicas)
+    for j, (en_phrase, es_rep) in enumerate(GLOSSARY_PHRASES_EN_ES.items()):
+        tok = f"__GPH_{text_idx}_{j}__"
+        mapping[tok] = es_rep
+        t = re.sub(rf"(?i)(?<!\w){re.escape(en_phrase)}(?!\w)", tok, t)
+
+    # Términos sueltos
+    base = len(GLOSSARY_PHRASES_EN_ES)
+    for j, (en_term, es_rep) in enumerate(GLOSSARY_TERMS_EN_ES.items()):
+        tok = f"__GTR_{text_idx}_{base + j}__"
+        mapping[tok] = es_rep
+        t = re.sub(rf"(?i)\b{re.escape(en_term)}\b", tok, t)
+
+    return t, mapping
+
+def _unprotect_glossary_text(es_text: str, mapping: dict[str, str]) -> str:
+    t = es_text or ""
+    for tok, rep in mapping.items():
+        t = t.replace(tok, rep)
+    return t
+
+def _post_edit_es(es_text: str) -> str:
+    """
+    Ajustes ligeros de estilo para ES (mejorar naturalidad sin romper meaning).
+    """
+    t = (es_text or "").strip()
+    # "úsalos con reflexión" -> "úsalos con criterio"
+    t = re.sub(r"(?i)\b(úsalos|úsalas|úsa(?:los|las))\s+con\s+reflexión\b", r"\1 con criterio", t)
+    # AI -> IA
+    t = re.sub(r"(?i)\bAI\b", "IA", t)
+    # espacios
+    t = re.sub(r"\s{2,}", " ", t)
+    return t
+
 # =============================================================================
 # Azure Translator
 # =============================================================================
@@ -368,15 +423,35 @@ def azure_translate_batch(texts: List[str], from_lang="en", to_lang="es") -> Lis
     return [item["translations"][0]["text"] for item in data]
 
 def translate_list_azure(texts: List[str], progress=None) -> List[str]:
+    """
+    Traduce una lista EN→ES con Azure Translator.
+    Protege glosario (tokens) para evitar errores de sentido y aplica post-edición ligera.
+    """
+    protected: List[str] = []
+    maps: List[dict[str, str]] = []
+    for i, t in enumerate(texts):
+        pt, mp = _protect_glossary_text(t or "", i)
+        protected.append(pt)
+        maps.append(mp)
+
     BATCH = 40
-    out: List[str] = []
-    n = len(texts)
+    raw_out: List[str] = []
+    n = len(protected)
+
     for i in range(0, n, BATCH):
-        chunk = texts[i:i+BATCH]
-        out.extend(azure_translate_batch(chunk, "en", "es"))
+        chunk = protected[i:i+BATCH]
+        raw_out.extend(azure_translate_batch(chunk, "en", "es"))
         if progress is not None and n:
             progress.progress(min(1.0, (i + len(chunk)) / n))
+
+    out: List[str] = []
+    for tr, mp in zip(raw_out, maps):
+        tr2 = _unprotect_glossary_text(tr, mp)
+        tr2 = _post_edit_es(tr2)
+        out.append(tr2)
+
     return out
+
 
 def translate_clusters_azure(clusters_en: List[Dict], progress=None) -> List[str]:
     texts = [(c.get("text_en") or "").strip() for c in clusters_en]
@@ -543,7 +618,6 @@ def mux_video_audio(video_file: str, audio_wav: str, output="video_doblado.mp4")
 # =============================================================================
 # Streamlit UI
 # =============================================================================
-APP_VERSION = "v11"
 st.set_page_config(page_title="Doblador EN→ES (Azure)", page_icon="🎬", layout="centered")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
