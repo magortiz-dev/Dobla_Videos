@@ -1,7 +1,7 @@
 # app.py — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
 # EN → ES con Azure Translator + Doblaje con Azure Speech + Whisper (ASR)
 #
-# #  - La traducción que SE VE y la que SE OYE es la MISMA (se traduce por "frases/clústeres", no por segmentos sueltos).
+#  - La traducción que SE VE y la que SE OYE es la MISMA (se traduce por "frases/clústeres", no por segmentos sueltos).
 #  - Clustering EN más inteligente: une segmentos cuando NO hay fin de frase real (evita pausas en mitad).
 #  - Mantiene sincronización por timestamps, y ajusta ritmo si el TTS se pasa de su ventana.
 
@@ -501,6 +501,56 @@ def merge_clusters_for_continuity(clusters_en: List[Dict], clusters_es: List[str
         i += 1
 
     return out_en, out_es
+
+# --- Reparación de huecos grandes dentro de una MISMA frase ---
+# Si Whisper mete un gap grande (p.ej. 4s) pero la frase continúa, adelantamos el inicio del siguiente clúster.
+REPAIR_GAP_MS = 1200          # a partir de aquí consideramos "hueco sospechoso"
+REPAIR_TARGET_GAP_MS = 140    # hueco objetivo entre clústeres tras reparar (ms)
+
+def repair_long_gaps_for_continuity(clusters_en: List[Dict], clusters_es: List[str]) -> List[Dict]:
+    """
+    Ajusta start_ms de clústeres EN cuando hay un hueco grande pero la frase continúa.
+    Mantiene el orden temporal y evita solapes (deja un pequeño hueco).
+    """
+    if not clusters_en or len(clusters_en) < 2:
+        return clusters_en
+    out = [dict(c) for c in clusters_en]
+
+    def es_continuation_start(s: str) -> bool:
+        s = (s or "").strip()
+        if not s:
+            return False
+        return (s[:1].islower()) or bool(ES_CONTINUATION_START_RE.search(s))
+
+    for i in range(len(out) - 1):
+        prev = out[i]
+        nxt = out[i + 1]
+        gap_ms = int(nxt["start_ms"]) - int(prev["end_ms"])
+
+        prev_es = (clusters_es[i] or "").strip() if i < len(clusters_es) else ""
+        nxt_es = (clusters_es[i+1] or "").strip() if i+1 < len(clusters_es) else ""
+
+        prev_es_strong = bool(ES_STRONG_END_RE.search(prev_es))
+        cont_es = es_continuation_start(nxt_es)
+
+        prev_en = (prev.get("text_en") or "").strip()
+        nxt_en = (nxt.get("text_en") or "").strip()
+        prev_en_strong = ends_strong_punct_en(prev_en)
+        cont_en = looks_continuation_start_en(nxt_en)
+
+        should_repair = (gap_ms >= REPAIR_GAP_MS) and (not prev_es_strong) and (cont_es or cont_en) and (not prev_en_strong)
+
+        if should_repair:
+            new_start = int(prev["end_ms"]) + REPAIR_TARGET_GAP_MS
+            if int(nxt["end_ms"]) - new_start < MIN_WINDOW_MS:
+                new_start = max(0, int(nxt["end_ms"]) - MIN_WINDOW_MS)
+            out[i + 1]["start_ms"] = new_start
+
+    for i in range(1, len(out)):
+        if int(out[i]["start_ms"]) <= int(out[i-1]["end_ms"]):
+            out[i]["start_ms"] = int(out[i-1]["end_ms"]) + REPAIR_TARGET_GAP_MS
+
+    return out
 
 
 # =============================================================================
