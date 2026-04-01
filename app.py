@@ -1,7 +1,9 @@
-# app.py — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
+# app.py (v11) — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
 # EN → ES con Azure Translator + Doblaje con Azure Speech + Whisper (ASR)
 #
+# Mejoras v11 (para tus ejemplos):
 #  - La traducción que SE VE y la que SE OYE es la MISMA (se traduce por "frases/clústeres", no por segmentos sueltos).
+#    Esto evita casos tipo: en pantalla "o incluso" pero en audio "ni siquiera".
 #  - Clustering EN más inteligente: une segmentos cuando NO hay fin de frase real (evita pausas en mitad).
 #  - Mantiene sincronización por timestamps, y ajusta ritmo si el TTS se pasa de su ventana.
 
@@ -459,6 +461,8 @@ def translate_clusters_azure(clusters_en: List[Dict], progress=None) -> List[str
 # --- Merge ES clústeres si la frase continúa (evita pausas tipo "imágenes ... o vídeos") ---
 ES_CONTINUATION_START_RE = re.compile(r'^(?:o|y|e|u|pero|sino|porque|aunque|mientras|cuando|que|con|para|por|en)\b', re.I)
 ES_STRONG_END_RE = re.compile(r'[.!?…]\s*$')
+ES_WEAK_END_RE = re.compile(r'\b(?:con|de|del|para|a|en|por|sin|sobre|entre|hacia|hasta|como)\s*$', re.I)
+EN_WEAK_END_RE = re.compile(r'\b(?:with|to|for|and|or|in|on|at|of|from|by)\s*$', re.I)
 
 def merge_clusters_for_continuity(clusters_en: List[Dict], clusters_es: List[str]) -> tuple[List[Dict], List[str]]:
     """
@@ -487,7 +491,8 @@ def merge_clusters_for_continuity(clusters_en: List[Dict], clusters_es: List[str
             prev_strong = bool(ES_STRONG_END_RE.search(cur_es))
             nxt_cont = (nxt_es[:1].islower()) or bool(ES_CONTINUATION_START_RE.search(nxt_es))
 
-            if (gap_ms <= 900) and (not prev_strong) and nxt_cont:
+            weak_end = bool(ES_WEAK_END_RE.search(cur_es))
+            if ((gap_ms <= 900) and (not prev_strong) and nxt_cont) or ((gap_ms <= 2500) and (not prev_strong) and weak_end):
                 cur_en["end_ms"] = int(nxt_en["end_ms"])
                 cur_en["text_en"] = (cur_en.get("text_en","").rstrip() + " " + (nxt_en.get("text_en","").lstrip())).strip()
                 cur_es = re.sub(r'[;:,.]\s*$', '', cur_es).strip()
@@ -504,8 +509,8 @@ def merge_clusters_for_continuity(clusters_en: List[Dict], clusters_es: List[str
 
 # --- Reparación de huecos grandes dentro de una MISMA frase ---
 # Si Whisper mete un gap grande (p.ej. 4s) pero la frase continúa, adelantamos el inicio del siguiente clúster.
-REPAIR_GAP_MS = 1200          # a partir de aquí consideramos "hueco sospechoso"
-REPAIR_TARGET_GAP_MS = 140    # hueco objetivo entre clústeres tras reparar (ms)
+REPAIR_GAP_MS = 900          # a partir de aquí consideramos "hueco sospechoso"
+REPAIR_TARGET_GAP_MS = 90    # hueco objetivo entre clústeres tras reparar (ms)
 
 def repair_long_gaps_for_continuity(clusters_en: List[Dict], clusters_es: List[str]) -> List[Dict]:
     """
@@ -538,7 +543,10 @@ def repair_long_gaps_for_continuity(clusters_en: List[Dict], clusters_es: List[s
         prev_en_strong = ends_strong_punct_en(prev_en)
         cont_en = looks_continuation_start_en(nxt_en)
 
-        should_repair = (gap_ms >= REPAIR_GAP_MS) and (not prev_es_strong) and (cont_es or cont_en) and (not prev_en_strong)
+        weak_es_end = bool(ES_WEAK_END_RE.search(prev_es))
+        weak_en_end = bool(EN_WEAK_END_RE.search(prev_en))
+        # Reparar si hay hueco grande y la frase continúa, o si acaba en preposición/conector
+        should_repair = (gap_ms >= REPAIR_GAP_MS) and (not prev_es_strong) and (not prev_en_strong) and (cont_es or cont_en or weak_es_end or weak_en_end)
 
         if should_repair:
             new_start = int(prev["end_ms"]) + REPAIR_TARGET_GAP_MS
@@ -713,11 +721,13 @@ def mux_video_audio(video_file: str, audio_wav: str, output="video_doblado.mp4")
 # =============================================================================
 # Streamlit UI
 # =============================================================================
+APP_VERSION = "v15"
 st.set_page_config(page_title="Doblador EN→ES (Azure)", page_icon="🎬", layout="centered")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
 render_title_text_first()
 st.caption("por Miguel Ángel Gómez Ortiz")
+st.caption(f"build: {APP_VERSION}")
 
 fuente = st.radio("Fuente del vídeo", ["URL / ruta", "Subir archivo"], horizontal=True)
 
