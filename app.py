@@ -1,9 +1,7 @@
-# app.py (v11) — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
+# app.py — Streamlit Cloud ready (sin depender de ffmpeg del sistema)
 # EN → ES con Azure Translator + Doblaje con Azure Speech + Whisper (ASR)
 #
-# Mejoras v11 (para tus ejemplos):
 #  - La traducción que SE VE y la que SE OYE es la MISMA (se traduce por "frases/clústeres", no por segmentos sueltos).
-#    Esto evita casos tipo: en pantalla "o incluso" pero en audio "ni siquiera".
 #  - Clustering EN más inteligente: une segmentos cuando NO hay fin de frase real (evita pausas en mitad).
 #  - Mantiene sincronización por timestamps, y ajusta ritmo si el TTS se pasa de su ventana.
 
@@ -341,15 +339,16 @@ def cluster_segments_en(segments: List[Dict]) -> List[Dict]:
 
 # --- Glosario/terminología (mejora traducción en contexto GenAI) ---
 # Objetivo: evitar traducciones erróneas tipo "prompts" -> "propone temas".
-# Puedes ampliar este glosario con otros términos internos de la empresa.
 GLOSSARY_PHRASES_EN_ES = {
     "meaningful prompts": "prompts con sentido",
     "meaningful prompt": "prompt con sentido",
 }
 GLOSSARY_TERMS_EN_ES = {
-    "prompts": "prompts",
-    "prompt": "prompt",
-    "generative ai": "IA generativa",
+    "prompts": "prompts"
+    ,"prompt": "prompt",
+    ,"deep fakes": "deep fakes"
+    ,"fine tunning": "fine tunning"
+#    ,"generative ai": "IA generativa"
 }
 
 def _protect_glossary_text(en_text: str, text_idx: int) -> tuple[str, dict[str, str]]:
@@ -735,13 +734,11 @@ def mux_video_audio(video_file: str, audio_wav: str, output="video_doblado.mp4")
 # =============================================================================
 # Streamlit UI
 # =============================================================================
-APP_VERSION = "v17"
 st.set_page_config(page_title="Doblador EN→ES (Azure)", page_icon="🎬", layout="centered")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
 render_title_text_first()
 st.caption("por Miguel Ángel Gómez Ortiz")
-st.caption(f"build: {APP_VERSION}")
 
 fuente = st.radio("Fuente del vídeo", ["URL / ruta", "Subir archivo"], horizontal=True)
 
