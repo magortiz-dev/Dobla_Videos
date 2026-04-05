@@ -345,7 +345,7 @@ GLOSSARY_PHRASES_EN_ES = {
 }
 GLOSSARY_TERMS_EN_ES = {
     "prompts": "prompts"
-    ,"prompt": "prompt",
+    ,"prompt": "prompt"
     ,"deep fakes": "deep fakes"
     ,"fine tunning": "fine tunning"
 #    ,"generative ai": "IA generativa"
