@@ -390,6 +390,20 @@ def _post_edit_es(es_text: str) -> str:
     t = re.sub(r"(?i)\b(úsalos|úsalas|úsa(?:los|las))\s+con\s+reflexión\b", r"\1 con criterio", t)
     # AI -> IA
     t = re.sub(r"(?i)\bAI\b", "IA", t)
+    # Añadir artículo cuando "IA generativa" actúa como sujeto (ej. "La IA generativa hace...")
+    def fix_generative_ai_article(txt: str) -> str:
+        verbs = r"(?:hace|permite|ayuda|facilita|convierte|transforma|mejora|impulsa|habilita|ofrece|aporta|crea|genera|reduce|aumenta|acelera|automatiza|optimiza)"
+        pat = re.compile(rf"(?i)\bIA generativa\b\s+(?P<verb>{verbs})\b")
+        def repl(m):
+            before = txt[:m.start()]
+            prev_words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", before)
+            prev = prev_words[-1].lower() if prev_words else ""
+            # Si ya hay determinante o preposición inmediata, no tocar
+            if prev in {"la","de","del","una","un","al","a","en","por","para","con","sin","sobre","entre","hacia","hasta","como"}:
+                return m.group(0)
+            return "La IA generativa " + m.group("verb")
+        return pat.sub(repl, txt)
+    t = fix_generative_ai_article(t)
     # espacios
     t = re.sub(r"\s{2,}", " ", t)
     return t
@@ -721,7 +735,7 @@ def mux_video_audio(video_file: str, audio_wav: str, output="video_doblado.mp4")
 # =============================================================================
 # Streamlit UI
 # =============================================================================
-APP_VERSION = "v16"
+APP_VERSION = "v17"
 st.set_page_config(page_title="Doblador EN→ES (Azure)", page_icon="🎬", layout="centered")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
@@ -818,6 +832,16 @@ if st.button("Procesar"):
                 clusters_es = translate_clusters_azure(st.session_state["clusters_en"], progress=prog)
                 prog.empty()
                 st.session_state["clusters_es"] = clusters_es
+                # Evitar pausas artificiales: unir continuidad y reparar huecos largos antes del TTS
+                st.session_state["clusters_en"], st.session_state["clusters_es"] = merge_clusters_for_continuity(
+                    st.session_state["clusters_en"], st.session_state["clusters_es"]
+                )
+                st.session_state["clusters_en"] = repair_long_gaps_for_continuity(
+                    st.session_state["clusters_en"], st.session_state["clusters_es"]
+                )
+                st.session_state["clusters_en"], st.session_state["clusters_es"] = merge_clusters_for_continuity(
+                    st.session_state["clusters_en"], st.session_state["clusters_es"]
+                )
 
             with st.spinner("Generando doblaje y sincronizando..."):
                 prog2 = st.progress(0.0)
@@ -858,6 +882,9 @@ if can_dub:
                     )
 
                 st.session_state["clusters_en"] = repair_long_gaps_for_continuity(st.session_state["clusters_en"], st.session_state["clusters_es"])
+            st.session_state["clusters_en"], st.session_state["clusters_es"] = merge_clusters_for_continuity(
+                st.session_state["clusters_en"], st.session_state["clusters_es"]
+            )
             with st.spinner("Generando doblaje y sincronizando..."):
                 prog2 = st.progress(0.0)
                 wav_tl = build_dubbed_timeline(st.session_state["video_file"],
