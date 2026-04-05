@@ -721,7 +721,7 @@ def mux_video_audio(video_file: str, audio_wav: str, output="video_doblado.mp4")
 # =============================================================================
 # Streamlit UI
 # =============================================================================
-APP_VERSION = "v15"
+APP_VERSION = "v16"
 st.set_page_config(page_title="Doblador EN→ES (Azure)", page_icon="🎬", layout="centered")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
@@ -791,9 +791,11 @@ if st.button("Procesar"):
                 st.session_state["clusters_en"], st.session_state["clusters_es"] = merge_clusters_for_continuity(
                     st.session_state["clusters_en"], st.session_state["clusters_es"]
                 )
+                st.session_state["clusters_en"] = repair_long_gaps_for_continuity(st.session_state["clusters_en"], st.session_state["clusters_es"])
                 st.session_state["clusters_en"], st.session_state["clusters_es"] = merge_clusters_for_continuity(
                     st.session_state["clusters_en"], st.session_state["clusters_es"]
                 )
+                st.session_state["clusters_en"] = repair_long_gaps_for_continuity(st.session_state["clusters_en"], st.session_state["clusters_es"])
                 st.session_state["transcript_es_full"] = " ".join(st.session_state["clusters_es"]).strip()
 
             st.subheader("🌍 Traducción (ES)")
@@ -855,6 +857,7 @@ if can_dub:
                         st.session_state["clusters_en"], st.session_state["clusters_es"]
                     )
 
+                st.session_state["clusters_en"] = repair_long_gaps_for_continuity(st.session_state["clusters_en"], st.session_state["clusters_es"])
             with st.spinner("Generando doblaje y sincronizando..."):
                 prog2 = st.progress(0.0)
                 wav_tl = build_dubbed_timeline(st.session_state["video_file"],
