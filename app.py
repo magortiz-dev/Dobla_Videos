@@ -1,19 +1,6 @@
 # app.py — v18 (2026)
 # Streamlit Cloud ready — EN → ES
 #
-# Cambios principales frente a v17:
-# 1) faster-whisper + CTranslate2 INT8 en CPU: menos RAM y más velocidad.
-# 2) Modelo inglés dedicado por defecto: small.en (mejor que small multilingüe para EN).
-#    Opciones: distil-large-v3 / turbo para más calidad si el entorno tiene memoria.
-# 3) Timestamps A NIVEL DE PALABRA y reconstrucción de frases completas:
-#    evita partir "with meaningful prompts..." en dos audios y elimina pausas artificiales.
-# 4) La misma frase traducida es la que se muestra, descarga y sintetiza.
-# 5) Azure Translator mantiene glosario + admite opcionalmente Custom Translator:
-#       AZURE_TRANSLATOR_CATEGORY = "tu-category-id"
-# 6) Azure Speech: voces Dragon HD disponibles en West Europe + voces estándar.
-#    SSML simplificado (sin style="newscast-casual") para una prosodia más predecible.
-# 7) TTS ajustado a la ventana temporal de CADA FRASE completa.
-# 8) Directorio temporal por ejecución para evitar colisiones entre usuarios.
 #
 # Secrets mínimos:
 # AZURE_TRANSLATOR_KEY = "..."
@@ -603,7 +590,7 @@ def translate_units_azure(units_en: List[Dict], progress=None) -> List[str]:
 # Azure Speech TTS
 # =============================================================================
 VOICE_OPTIONS = {
-    "Tristán HD — recomendado": "es-es-Tristan:DragonHDLatestNeural",
+    "Tristán HD": "es-es-Tristan:DragonHDLatestNeural",
     "Ximena HD": "es-es-Ximena:DragonHDLatestNeural",
     "Dario Neural": "es-ES-DarioNeural",
     "Álvaro Neural": "es-ES-AlvaroNeural",
@@ -839,7 +826,6 @@ def mux_video_audio(
 # =============================================================================
 # Streamlit
 # =============================================================================
-APP_VERSION = "v18"
 
 st.set_page_config(
     page_title="Doblador EN→ES (Azure)",
@@ -853,7 +839,6 @@ st.markdown(
 
 render_title_text_first()
 st.caption("por Miguel Ángel Gómez Ortiz")
-st.caption(f"build: {APP_VERSION}")
 
 fuente = st.radio(
     "Fuente del vídeo",
