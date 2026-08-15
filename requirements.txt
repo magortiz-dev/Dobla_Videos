@@ -1,19 +1,15 @@
 streamlit>=1.32
 
-# Descarga de vídeo
+# Vídeo / descarga
 yt-dlp>=2024.12.13
-
-# ASR (Whisper)
-openai-whisper>=20231117
-torch>=2.3.0
-numpy<2.0,>=1.26
-
-# HTTP (Azure Translator)
 requests>=2.31.0
+
+# Audio / ffmpeg portátil
+pydub==0.25.1
+imageio-ffmpeg>=0.4.9
+
+# ASR rápido (CTranslate2 INT8; no necesita torch)
+faster-whisper>=1.1.0,<2
 
 # Azure TTS
 azure-cognitiveservices-speech>=1.38.0
-
-# ffmpeg portable (Cloud)
-imageio-ffmpeg>=0.4.9
-pydub==0.25.1
