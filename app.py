@@ -251,7 +251,7 @@ def resolve_source(source: str, uploaded_file, workdir: str) -> str:
 
     s = (source or "").strip().strip('"').strip("'")
     if not s:
-        raise RuntimeError("Proporciona una URL/ruta o sube un archivo.")
+        raise RuntimeError("Proporciona una URL/ o sube un archivo.")
 
     if re.match(r"^https?://", s, re.I):
         if _is_youtube(s):
@@ -842,7 +842,7 @@ st.caption("por Miguel Ángel Gómez Ortiz")
 
 fuente = st.radio(
     "Fuente del vídeo",
-    ["URL / ruta", "Subir archivo"],
+    ["Subir archivo", "URL / ruta"],
     horizontal=True,
 )
 
